@@ -1,0 +1,50 @@
+name: Build Dear ImGui DirectX11 Example
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "examples/example_win32_directx11/**"
+      - "backends/**"
+      - "imgui*.cpp"
+      - "imgui*.h"
+      - ".github/workflows/build-imgui-dx11.yml"
+
+jobs:
+  build:
+    name: Build DirectX11 example
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Set up MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Build executable
+        shell: cmd
+        run: |
+          if not exist build mkdir build
+          cl.exe /nologo /EHsc /std:c++17 /MD /utf-8 ^
+            /I. /Ibackends ^
+            examples\example_win32_directx11\main.cpp ^
+            backends\imgui_impl_dx11.cpp ^
+            backends\imgui_impl_win32.cpp ^
+            imgui.cpp ^
+            imgui_demo.cpp ^
+            imgui_draw.cpp ^
+            imgui_tables.cpp ^
+            imgui_widgets.cpp ^
+            /Fe:build\example_win32_directx11.exe ^
+            /Fo:build\ ^
+            /link d3d11.lib d3dcompiler.lib dxgi.lib
+
+      - name: Upload executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: imgui-directx11-example
+          path: build/example_win32_directx11.exe
+          if-no-files-found: error
