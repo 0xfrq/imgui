@@ -47,6 +47,7 @@ struct LlamaRunResult
     bool last = false;
     bool partial = false;
     bool streaming = false;
+    bool cancelled = false;
     bool slot_info_available = false;
     bool metrics_available = false;
     bool prompt_cache_reused = false;
@@ -131,6 +132,7 @@ public:
     LlamaServerBackend& operator=(const LlamaServerBackend&) = delete;
 
     bool StartComparison(const std::vector<LlamaModelJob>& models, const std::string& prompt, const LlamaRunConfig& config, std::string& error);
+    void RequestStop();
     void Stop();
     bool PopResult(LlamaRunResult& result);
     bool IsBusy() const;
@@ -145,6 +147,8 @@ private:
     bool IsStopRequested() const;
     void SetStatus(const std::string& status);
     void PushResult(LlamaRunResult result);
+    void TerminateServer();
+    mutable std::mutex process_mutex_;
 
     mutable std::mutex mutex_;
     std::thread worker_;

@@ -354,6 +354,7 @@ struct AppState
     double prompt_eval_seconds = 0.0;
     double memory_gb = 0.0;
     bool run_busy = false;
+    bool stop_requested = false;
     std::string streaming_model;
     int streaming_reasoning_message = -1;
     int streaming_response_message = -1;
@@ -422,6 +423,7 @@ static void ResetTelemetry(AppState& app)
     app.decode_tokens_per_second = 0.0;
     app.prompt_eval_seconds = 0.0;
     app.memory_gb = 0.0;
+    app.stop_requested = false;
     app.comparison_results.clear();
     app.latest_result = {};
     app.has_latest_result = false;
@@ -481,6 +483,12 @@ static std::string FormatCount(int count)
 static void AppendRunTrace(AppState& app, const LlamaRunResult& result)
 {
     const std::string model = result.model;
+    if (result.cancelled)
+    {
+        const std::string detail = "user stopped generation, " + FormatCount(result.response_bytes) + " response bytes received";
+        app.trace.push_back({ model, "request", FormatSeconds(result.request_seconds), "stopped", detail });
+        return;
+    }
     if (!result.ok)
     {
         app.trace.push_back({ model, "request", FormatSeconds(result.request_seconds), "error", result.error.empty() ? "llama-server did not return a usable result" : result.error });
@@ -572,7 +580,9 @@ static void ApplyStreamingDelta(AppState& app, const LlamaRunResult& result)
 static void FinalizeStreamingMessages(AppState& app, const LlamaRunResult& result)
 {
     ResetStreamingMessages(app, result.model);
-    const std::string annotation = "llama.cpp; prompt " + FormatRate(result.prompt_tokens_per_second) + "; decode " + FormatRate(result.decode_tokens_per_second);
+    const std::string annotation = result.cancelled
+        ? "stopped by user; partial response"
+        : "llama.cpp; prompt " + FormatRate(result.prompt_tokens_per_second) + "; decode " + FormatRate(result.decode_tokens_per_second);
     if (!result.reasoning.empty())
     {
         if (app.streaming_reasoning_message < 0)
@@ -684,13 +694,24 @@ static void StartRun(AppState& app, const std::string& submitted_prompt)
         return;
     }
     app.run_busy = true;
+    app.stop_requested = false;
     std::fill_n(app.prompt, sizeof(app.prompt), '\0');
+}
+
+static void StopRun(AppState& app)
+{
+    if (!app.run_busy || app.stop_requested)
+        return;
+    app.stop_requested = true;
+    app.backend.RequestStop();
+    ShowToast(app, "Stopping generation...");
 }
 
 static void AdvanceBackend(AppState& app, float delta_time)
 {
     LlamaRunResult result;
     bool received_result = false;
+    bool stopped_result = false;
     while (app.backend.PopResult(result))
     {
         received_result = true;
@@ -706,7 +727,14 @@ static void AdvanceBackend(AppState& app, float delta_time)
         app.has_latest_result = true;
         app.comparison_results.push_back(result);
         AppendRunTrace(app, result);
-        if (result.ok)
+        if (result.cancelled)
+        {
+            stopped_result = true;
+            FinalizeStreamingMessages(app, result);
+            if (result.text.empty() && result.reasoning.empty())
+                AddMessage(app, result.model, "Generation stopped before a response was produced.", true, false, "stopped by user");
+        }
+        else if (result.ok)
         {
             FinalizeStreamingMessages(app, result);
             SampleTelemetry(app, result);
@@ -719,9 +747,13 @@ static void AdvanceBackend(AppState& app, float delta_time)
     }
     if (app.run_busy && !app.backend.IsBusy())
     {
+        const bool was_stop_requested = app.stop_requested;
         app.run_busy = false;
-        if (received_result)
+        if (was_stop_requested || stopped_result)
+            ShowToast(app, "Generation stopped");
+        else if (received_result)
             ShowToast(app, "llama.cpp comparison complete");
+        app.stop_requested = false;
     }
     if (app.toast_remaining > 0.0f)
         app.toast_remaining = std::max(0.0f, app.toast_remaining - delta_time);
@@ -795,6 +827,17 @@ static bool PrimaryButton(const char* label, const ImVec2& size = ImVec2(0.0f, 0
     ImGui::PushStyleColor(ImGuiCol_ButtonHovered, kBlueBright);
     ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.160f, 0.440f, 0.780f, 1.0f));
     ImGui::PushStyleColor(ImGuiCol_Text, kBlueInk);
+    const bool clicked = ImGui::Button(label, size);
+    ImGui::PopStyleColor(4);
+    return clicked;
+}
+
+static bool DangerButton(const char* label, const ImVec2& size = ImVec2(0.0f, 0.0f))
+{
+    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.640f, 0.145f, 0.125f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.900f, 0.235f, 0.190f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.500f, 0.090f, 0.080f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.000f, 0.930f, 0.915f, 1.0f));
     const bool clicked = ImGui::Button(label, size);
     ImGui::PopStyleColor(4);
     return clicked;
@@ -1349,11 +1392,20 @@ static void DrawConversation(AppState& app)
     const bool submit = ImGui::IsItemActive() && ImGui::IsKeyPressed(ImGuiKey_Enter) && !ImGui::GetIO().KeyShift;
     ImGui::PopStyleColor(3);
     ImGui::TextColored(kMuted, "Enter sends; Shift+Enter adds a line");
-    ImGui::SameLine(ImGui::GetWindowWidth() - 135.0f);
-    ImGui::BeginDisabled(app.run_busy);
-    if (PrimaryButton("Run selected##prompt", ImVec2(118.0f, 30.0f)) || submit)
-        StartRun(app, app.prompt);
-    ImGui::EndDisabled();
+    const float prompt_action_width = app.run_busy ? 145.0f : 118.0f;
+    ImGui::SameLine(ImGui::GetWindowWidth() - prompt_action_width - 12.0f);
+    if (app.run_busy)
+    {
+        ImGui::BeginDisabled(app.stop_requested);
+        if (DangerButton("Stop generating##prompt", ImVec2(prompt_action_width, 30.0f)))
+            StopRun(app);
+        ImGui::EndDisabled();
+    }
+    else
+    {
+        if (PrimaryButton("Run selected##prompt", ImVec2(prompt_action_width, 30.0f)) || submit)
+            StartRun(app, app.prompt);
+    }
 }
 
 static void DrawDiagnostics(const AppState& app)
@@ -1387,7 +1439,9 @@ static void DrawDiagnostics(const AppState& app)
             ImGui::TableSetColumnIndex(0);
             ImGui::TextColored(kInk, "%s", result.model.c_str());
             ImGui::TableSetColumnIndex(1);
-            ImGui::TextColored(result.ok ? kBlueBright : kError, "%s", result.ok ? "measured" : "error");
+            const char* status_label = result.cancelled ? "stopped" : (result.ok ? "measured" : "error");
+            const ImVec4 status_color = result.cancelled ? kMuted : (result.ok ? kBlueBright : kError);
+            ImGui::TextColored(status_color, "%s", status_label);
             ImGui::TableSetColumnIndex(2);
             ImGui::TextColored(kInkSoft, "%s", FormatRate(result.prompt_tokens_per_second).c_str());
             ImGui::TableSetColumnIndex(3);
@@ -1405,7 +1459,7 @@ static void DrawDiagnostics(const AppState& app)
             ImGui::TableSetColumnIndex(9);
             ImGui::TextColored(kInkSoft, "%s", FormatMemory(result.memory_gb).c_str());
             ImGui::TableSetColumnIndex(10);
-            ImGui::TextColored(kInkSoft, "%s", result.ok ? result.finish_reason.c_str() : "error");
+            ImGui::TextColored(kInkSoft, "%s", result.cancelled ? "stopped by user" : (result.ok ? result.finish_reason.c_str() : "error"));
         }
         ImGui::EndTable();
     }
@@ -1432,6 +1486,7 @@ static void DrawDiagnostics(const AppState& app)
                 ImGui::TableSetColumnIndex(1);
                 ImGui::TextWrapped("%s", value.c_str());
             };
+            detail("run status", result.cancelled ? "stopped by user" : (result.ok ? "completed" : "error"));
             detail("response id", result.response_id.empty() ? "-" : result.response_id);
             detail("response type", result.response_object.empty() ? "-" : result.response_object);
             detail("server model", result.response_model);
@@ -1465,7 +1520,7 @@ static void DrawDiagnostics(const AppState& app)
     }
     for (const LlamaRunResult& result : app.comparison_results)
     {
-        if (!result.ok && !result.error.empty())
+        if (!result.ok && !result.cancelled && !result.error.empty())
             ImGui::TextColored(kError, "%s: %s", result.model.c_str(), result.error.c_str());
     }
 }
@@ -1499,7 +1554,7 @@ static void DrawTrace(const AppState& app)
             ImGui::TableSetColumnIndex(2);
             ImGui::TextColored(kInk, "%s", entry.duration.c_str());
             ImGui::TableSetColumnIndex(3);
-            ImGui::TextColored(entry.status == "error" ? kError : kBlueBright, "%s", entry.status.c_str());
+            ImGui::TextColored(entry.status == "error" ? kError : (entry.status == "stopped" ? kMuted : kBlueBright), "%s", entry.status.c_str());
             ImGui::TableSetColumnIndex(4);
             ImGui::TextWrapped("%s", entry.detail.c_str());
         }
@@ -1560,7 +1615,8 @@ static void DrawWorkspace(AppState& app)
     PanelHeading("MODEL COMPARISON", selected_label.c_str());
     ImGui::SameLine(0.0f, 8.0f);
     ImGui::TextColored(kMuted, "same prompt, sequential runs");
-    ImGui::SameLine(std::max(ImGui::GetCursorPosX(), ImGui::GetWindowWidth() - 235.0f));
+    const float action_width = app.run_busy ? 280.0f : 235.0f;
+    ImGui::SameLine(std::max(ImGui::GetCursorPosX(), ImGui::GetWindowWidth() - action_width));
     if (QuietButton("Copy run command", ImVec2(112.0f, 30.0f)))
     {
         const std::string command = CurrentRunCommand(app);
@@ -1568,10 +1624,17 @@ static void DrawWorkspace(AppState& app)
         ShowToast(app, "Run command copied");
     }
     ImGui::SameLine(0.0f, 6.0f);
-    ImGui::BeginDisabled(app.run_busy);
-    if (PrimaryButton("Run selected##header", ImVec2(112.0f, 30.0f)))
+    if (app.run_busy)
+    {
+        ImGui::BeginDisabled(app.stop_requested);
+        if (DangerButton("Stop generating##header", ImVec2(138.0f, 30.0f)))
+            StopRun(app);
+        ImGui::EndDisabled();
+    }
+    else if (PrimaryButton("Run selected##header", ImVec2(112.0f, 30.0f)))
+    {
         StartRun(app, {});
-    ImGui::EndDisabled();
+    }
 
     ImGui::Dummy(ImVec2(0.0f, 10.0f));
     if (app.pane != Pane::Settings)
@@ -1632,8 +1695,11 @@ static void DrawTelemetry(AppState& app)
 {
     PanelHeading("RUN TELEMETRY", "Signal");
     ImGui::SameLine(ImGui::GetWindowWidth() - 88.0f);
-    const bool latest_error = app.has_latest_result && !app.latest_result.ok;
-    ImGui::TextColored(latest_error ? kError : (app.telemetry_sampled ? kBlueBright : kMuted), "%s", app.run_busy ? "sampling" : (latest_error ? "error" : (app.telemetry_sampled ? "measured" : "waiting")));
+    const bool latest_stopped = app.has_latest_result && app.latest_result.cancelled;
+    const bool latest_error = app.has_latest_result && !app.latest_result.ok && !latest_stopped;
+    const ImVec4 telemetry_status_color = app.run_busy ? kBlueBright : (latest_stopped ? kMuted : (latest_error ? kError : (app.telemetry_sampled ? kBlueBright : kMuted)));
+    const char* telemetry_status = app.run_busy ? "sampling" : (latest_stopped ? "stopped" : (latest_error ? "error" : (app.telemetry_sampled ? "measured" : "waiting")));
+    ImGui::TextColored(telemetry_status_color, "%s", telemetry_status);
     ImGui::Dummy(ImVec2(0.0f, 10.0f));
 
     const std::string prompt_rate = FormatRate(app.prompt_tokens_per_second);

@@ -412,12 +412,22 @@ bool LlamaServerBackend::StartComparison(const std::vector<LlamaModelJob>& model
     return true;
 }
 
-void LlamaServerBackend::Stop()
+void LlamaServerBackend::RequestStop()
 {
     {
         std::lock_guard<std::mutex> lock(mutex_);
         stop_requested_ = true;
+        if (busy_)
+            status_ = "stopping";
     }
+    // Terminate the child without closing its handles; the worker may still be
+    // inside WinHTTP and remains responsible for final handle cleanup.
+    TerminateServer();
+}
+
+void LlamaServerBackend::Stop()
+{
+    RequestStop();
     if (worker_.joinable())
         worker_.join();
     StopServer();
@@ -468,6 +478,20 @@ void LlamaServerBackend::RunComparison(std::vector<LlamaModelJob> models, std::s
 
 bool LlamaServerBackend::RunModel(const LlamaModelJob& model, const std::string& prompt, const LlamaRunConfig& config, LlamaRunResult& result)
 {
+    const auto mark_cancelled = [&]()
+    {
+        result.ok = false;
+        result.cancelled = true;
+        result.partial = false;
+        result.finish_reason = "stopped";
+        result.error = "Generation stopped by user";
+    };
+
+    if (IsStopRequested())
+    {
+        mark_cancelled();
+        return false;
+    }
     if (model.path.empty())
     {
         result.error = "No local model file is attached to this entry";
@@ -479,12 +503,24 @@ bool LlamaServerBackend::RunModel(const LlamaModelJob& model, const std::string&
     const auto server_started = std::chrono::steady_clock::now();
     if (!StartServer(model, config, error))
     {
-        result.error = error;
+        if (IsStopRequested())
+            mark_cancelled();
+        else
+            result.error = error;
         return false;
     }
     if (!WaitForHealth(config, error))
     {
-        result.error = error;
+        if (IsStopRequested())
+            mark_cancelled();
+        else
+            result.error = error;
+        StopServer();
+        return false;
+    }
+    if (IsStopRequested())
+    {
+        mark_cancelled();
         StopServer();
         return false;
     }
@@ -506,6 +542,14 @@ bool LlamaServerBackend::RunModel(const LlamaModelJob& model, const std::string&
     std::string pending_reasoning_delta;
     bool stream_emitted = false;
     auto last_stream_emit = std::chrono::steady_clock::now() - std::chrono::seconds(1);
+    const auto finish_cancelled = [&]()
+    {
+        mark_cancelled();
+        result.streaming = true;
+        result.text = stream_text;
+        result.reasoning = stream_reasoning;
+        result.response_bytes = static_cast<int>(response.size());
+    };
     const auto flush_stream_update = [&]()
     {
         if (pending_delta.empty() && pending_reasoning_delta.empty())
@@ -554,7 +598,12 @@ bool LlamaServerBackend::RunModel(const LlamaModelJob& model, const std::string&
                 flush_stream_update();
         }
     };
-    const double cpu_before = ReadProcessCpuSeconds(process_.hProcess);
+    HANDLE process_handle = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(process_mutex_);
+        process_handle = process_.hProcess;
+    }
+    const double cpu_before = ReadProcessCpuSeconds(process_handle);
     const auto request_started = std::chrono::steady_clock::now();
     const bool request_ok = HttpRequest(config.port, L"POST", L"/v1/chat/completions", body.str(), response, status_code, error, on_stream_chunk);
     on_stream_chunk("\n");
@@ -562,8 +611,17 @@ bool LlamaServerBackend::RunModel(const LlamaModelJob& model, const std::string&
     result.request_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - request_started).count();
     result.http_status = static_cast<int>(status_code);
     result.response_bytes = static_cast<int>(response.size());
+    if (IsStopRequested())
+    {
+        finish_cancelled();
+        StopServer();
+        return false;
+    }
     if (!request_ok)
     {
+        result.text = stream_text;
+        result.reasoning = stream_reasoning;
+        result.streaming = !stream_text.empty() || !stream_reasoning.empty();
         result.error = error;
         StopServer();
         return false;
@@ -596,6 +654,13 @@ bool LlamaServerBackend::RunModel(const LlamaModelJob& model, const std::string&
     ExtractJsonString(response, "\"system_fingerprint\"", result.system_fingerprint);
     ExtractJsonStringLast(response, "\"finish_reason\"", result.finish_reason);
     ExtractJsonString(response, "\"model\"", result.response_model);
+
+    if (IsStopRequested())
+    {
+        finish_cancelled();
+        StopServer();
+        return false;
+    }
 
     double prompt_ms = 0.0;
     double predicted_ms = 0.0;
@@ -804,8 +869,12 @@ bool LlamaServerBackend::RunModel(const LlamaModelJob& model, const std::string&
     if (result.context_size <= 0)
         result.context_size = config.context;
 
-    const ProcessSnapshot memory = ReadProcessSnapshot(process_.hProcess);
-    const double cpu_after = ReadProcessCpuSeconds(process_.hProcess);
+    {
+        std::lock_guard<std::mutex> lock(process_mutex_);
+        process_handle = process_.hProcess;
+    }
+    const ProcessSnapshot memory = ReadProcessSnapshot(process_handle);
+    const double cpu_after = ReadProcessCpuSeconds(process_handle);
     result.prompt_tokens = static_cast<int>(prompt_tokens);
     result.predicted_tokens = static_cast<int>(predicted_tokens);
     result.total_tokens = static_cast<int>(total_tokens);
@@ -882,20 +951,38 @@ bool LlamaServerBackend::StartServer(const LlamaModelJob& model, const LlamaRunC
         error = "Could not start llama-server.exe";
         return false;
     }
-    process_ = process;
+    {
+        std::lock_guard<std::mutex> lock(process_mutex_);
+        process_ = process;
+    }
+    if (IsStopRequested())
+        TerminateServer();
     return true;
 }
 
 void LlamaServerBackend::StopServer()
 {
-    if (process_.hProcess)
+    PROCESS_INFORMATION process = {};
     {
-        ::TerminateProcess(process_.hProcess, 0);
-        ::WaitForSingleObject(process_.hProcess, 3000);
-        ::CloseHandle(process_.hThread);
-        ::CloseHandle(process_.hProcess);
+        std::lock_guard<std::mutex> lock(process_mutex_);
+        process = process_;
         process_ = {};
     }
+    if (process.hProcess)
+    {
+        ::TerminateProcess(process.hProcess, 0);
+        ::WaitForSingleObject(process.hProcess, 3000);
+        if (process.hThread)
+            ::CloseHandle(process.hThread);
+        ::CloseHandle(process.hProcess);
+    }
+}
+
+void LlamaServerBackend::TerminateServer()
+{
+    std::lock_guard<std::mutex> lock(process_mutex_);
+    if (process_.hProcess)
+        ::TerminateProcess(process_.hProcess, 0);
 }
 
 bool LlamaServerBackend::WaitForHealth(const LlamaRunConfig& config, std::string& error)
@@ -907,7 +994,12 @@ bool LlamaServerBackend::WaitForHealth(const LlamaRunConfig& config, std::string
             error = "Run cancelled";
             return false;
         }
-        if (process_.hProcess && ::WaitForSingleObject(process_.hProcess, 0) == WAIT_OBJECT_0)
+        HANDLE process_handle = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(process_mutex_);
+            process_handle = process_.hProcess;
+        }
+        if (process_handle && ::WaitForSingleObject(process_handle, 0) == WAIT_OBJECT_0)
         {
             error = "llama-server exited before becoming healthy";
             return false;
