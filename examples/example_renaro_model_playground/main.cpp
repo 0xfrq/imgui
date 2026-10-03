@@ -41,6 +41,7 @@ static ID3D11RenderTargetView*  g_mainRenderTargetView = nullptr;
 static ID3D11ShaderResourceView* g_logo_srv = nullptr;
 
 static ImFont* g_font_body = nullptr;
+static ImFont* g_font_bold = nullptr;
 static ImFont* g_font_mono = nullptr;
 
 static const ImVec4 kBg = ImVec4(0.045f, 0.060f, 0.095f, 1.0f);
@@ -312,9 +313,11 @@ struct ModelEntry
 
 struct TraceEntry
 {
+    std::string model;
     std::string event;
     std::string duration;
     std::string status;
+    std::string detail;
 };
 
 struct AppState
@@ -324,7 +327,8 @@ struct AppState
     std::vector<Message> messages;
     std::vector<TraceEntry> trace;
     std::vector<LlamaRunResult> comparison_results;
-    std::string active_model;
+    LlamaRunResult latest_result;
+    bool has_latest_result = false;
     std::string imported_path;
     std::wstring server_path;
     std::string toast;
@@ -332,15 +336,27 @@ struct AppState
     char command_search[256] = {};
     float temperature = 0.70f;
     int context = 8192;
+    int max_tokens = 512;
     int threads = 8;
+    int threads_batch = 8;
     int gpu_layers = 0;
+    int batch_size = 512;
+    int ubatch_size = 512;
     int seed = 42;
+    bool flash_attention = false;
+    bool cache_prompt = true;
+    bool mmap = true;
+    bool mlock = false;
+    bool kv_offload = true;
     bool telemetry_sampled = false;
     double prompt_tokens_per_second = 0.0;
     double decode_tokens_per_second = 0.0;
     double prompt_eval_seconds = 0.0;
     double memory_gb = 0.0;
     bool run_busy = false;
+    std::string streaming_model;
+    int streaming_reasoning_message = -1;
+    int streaming_response_message = -1;
     float toast_remaining = 0.0f;
     bool command_palette = false;
     bool command_focus_search = false;
@@ -349,20 +365,8 @@ struct AppState
 
     AppState()
     {
-        models = {
-            { "Qwen3 8B", "8.2B  /  GGUF  /  select a file", {}, false },
-            { "Llama 3.1 8B", "8.0B  /  GGUF  /  select a file", {}, false },
-            { "Mistral Nemo", "12.2B  /  GGUF  /  select a file", {}, false },
-            { "Gemma 3 12B", "12.2B  /  GGUF  /  select a file", {}, false }
-        };
         messages = {
-            { "Renaro", "Select one or more local GGUF models, then run the same prompt against each model to compare output and timings.", false, true, {} }
-        };
-        trace = {
-            { "load context", "-", "pending" },
-            { "prefill", "-", "pending" },
-            { "decode loop", "-", "pending" },
-            { "stream tokens", "-", "pending" }
+            { "Renaro", "Import one or more local GGUF models, select the files you want to compare, then run the same prompt against each model.", false, true, {} }
         };
     }
 };
@@ -380,9 +384,20 @@ static std::string CurrentRunCommand(const AppState& app)
                     << " -c " << app.context
                     << " --host 127.0.0.1 --port 8080"
                     << " -t " << app.threads
+                    << " -tb " << app.threads_batch
                     << " -ngl " << app.gpu_layers
+                    << " -b " << app.batch_size
+                    << " -ub " << app.ubatch_size
                     << " --seed " << app.seed
                     << " --temp " << std::fixed << std::setprecision(2) << app.temperature;
+            if (app.flash_attention)
+                command << " --flash-attn on";
+            if (!app.mmap)
+                command << " --no-mmap";
+            if (app.mlock)
+                command << " --mlock";
+            if (!app.kv_offload)
+                command << " --no-kv-offload";
             return command.str();
         }
     }
@@ -408,12 +423,13 @@ static void ResetTelemetry(AppState& app)
     app.prompt_eval_seconds = 0.0;
     app.memory_gb = 0.0;
     app.comparison_results.clear();
+    app.latest_result = {};
+    app.has_latest_result = false;
+    app.trace.clear();
+    app.streaming_model.clear();
+    app.streaming_reasoning_message = -1;
+    app.streaming_response_message = -1;
     app.bars = { 0.26f, 0.42f, 0.34f, 0.58f, 0.49f, 0.72f, 0.62f, 0.84f, 0.74f, 0.94f, 0.79f, 0.68f };
-    for (TraceEntry& entry : app.trace)
-    {
-        entry.duration = "-";
-        entry.status = "pending";
-    }
 }
 
 static size_t SelectedModelCount(const AppState& app)
@@ -435,7 +451,7 @@ static std::string FormatRate(double rate)
     if (rate <= 0.0)
         return "-";
     std::ostringstream value;
-    value << std::fixed << std::setprecision(1) << rate << " tok/s";
+    value << std::fixed << std::setprecision(1) << rate << " tokens per second";
     return value.str();
 }
 
@@ -448,6 +464,67 @@ static std::string FormatMemory(double gigabytes)
     return value.str();
 }
 
+static std::string FormatMilliseconds(double milliseconds)
+{
+    if (milliseconds <= 0.0)
+        return "-";
+    std::ostringstream value;
+    value << std::fixed << std::setprecision(1) << milliseconds << " ms";
+    return value.str();
+}
+
+static std::string FormatCount(int count)
+{
+    return count > 0 ? std::to_string(count) : "-";
+}
+
+static void AppendRunTrace(AppState& app, const LlamaRunResult& result)
+{
+    const std::string model = result.model;
+    if (!result.ok)
+    {
+        app.trace.push_back({ model, "request", FormatSeconds(result.request_seconds), "error", result.error.empty() ? "llama-server did not return a usable result" : result.error });
+        return;
+    }
+
+    const std::string token_detail = "prompt " + FormatCount(result.prompt_tokens)
+        + ", generated " + FormatCount(result.predicted_tokens)
+        + ", total " + FormatCount(result.total_tokens)
+        + ", cached " + FormatCount(result.tokens_cached)
+        + ", reasoning " + FormatCount(result.reasoning_tokens)
+        + (result.prompt_cache_reused ? ", cache reused" : "");
+    const std::string memory_detail = "peak " + FormatMemory(result.peak_memory_gb)
+        + ", private " + FormatMemory(result.private_memory_gb);
+    const std::string server_detail = (result.model_alias.empty() ? "local model" : result.model_alias)
+        + ", context " + FormatCount(result.context_size)
+        + ", batch " + FormatCount(result.batch_size)
+        + ", ubatch " + FormatCount(result.ubatch_size)
+        + ", threads " + FormatCount(result.threads)
+        + ", GPU layers " + FormatCount(result.gpu_layers);
+    app.trace.push_back({ model, "server load", FormatSeconds(result.server_load_seconds), "ready", "llama-server process and /health" });
+    app.trace.push_back({ model, "server config", "-", "observed", server_detail });
+    app.trace.push_back({ model, "prompt eval", FormatMilliseconds(result.prompt_ms), FormatRate(result.prompt_tokens_per_second), token_detail + ", " + FormatMilliseconds(result.prompt_ms_per_token) + " per token" });
+    app.trace.push_back({ model, "decode", FormatMilliseconds(result.predicted_ms), FormatRate(result.decode_tokens_per_second), "predicted " + FormatCount(result.tokens_predicted) + ", " + FormatMilliseconds(result.predicted_ms_per_token) + " per token" });
+    app.trace.push_back({ model, "response", FormatSeconds(result.request_seconds), result.finish_reason, "HTTP " + std::to_string(result.http_status) + ", " + result.timings_source + ", " + FormatCount(result.response_bytes) + " bytes" });
+    if (result.slot_info_available)
+    {
+        const std::string slot_detail = "slot " + std::to_string(result.slot_id)
+            + ", state " + (result.slot_state.empty() ? "unknown" : result.slot_state)
+            + ", past " + FormatCount(result.n_past)
+            + ", prompt " + FormatCount(result.n_prompt_tokens)
+            + ", decoded " + FormatCount(result.n_decoded)
+            + ", cache " + FormatCount(result.n_cache_tokens)
+            + (result.stopped_eos ? ", EOS" : "")
+            + (result.stopped_limit ? ", limit" : "")
+            + (result.slot_truncated ? ", truncated" : "");
+        app.trace.push_back({ model, "slot state", FormatMilliseconds(result.total_ms), result.slot_state.empty() ? "observed" : result.slot_state, slot_detail });
+    }
+    app.trace.push_back({ model, "memory", FormatMemory(result.memory_gb), "sampled", memory_detail });
+    app.trace.push_back({ model, "CPU", FormatSeconds(result.cpu_seconds), "process time", "tokenize " + FormatMilliseconds(result.tokenize_ms) + ", sample " + FormatMilliseconds(result.sample_ms) });
+    if (result.metrics_available)
+        app.trace.push_back({ model, "metrics", "-", "available", result.metrics_summary });
+}
+
 static void SampleTelemetry(AppState& app, const LlamaRunResult& result)
 {
     app.telemetry_sampled = result.ok;
@@ -458,14 +535,80 @@ static void SampleTelemetry(AppState& app, const LlamaRunResult& result)
     const float prompt_scale = std::clamp(static_cast<float>(result.prompt_tokens_per_second / 100.0), 0.12f, 0.98f);
     const float decode_scale = std::clamp(static_cast<float>(result.decode_tokens_per_second / 50.0), 0.12f, 0.98f);
     app.bars = { prompt_scale * 0.72f, prompt_scale * 0.88f, prompt_scale * 0.66f, decode_scale * 0.72f, decode_scale * 0.54f, decode_scale * 0.86f, decode_scale * 0.70f, decode_scale * 0.92f, decode_scale * 0.78f, decode_scale, decode_scale * 0.88f, decode_scale * 0.74f };
-    const std::string prompt_duration = FormatSeconds(result.prompt_eval_seconds);
-    const std::string decode_duration = FormatRate(result.decode_tokens_per_second);
-    app.trace = {
-        { "load context", prompt_duration, result.ok ? "sampled" : "error" },
-        { "prefill", prompt_duration, result.ok ? "sampled" : "error" },
-        { "decode loop", decode_duration, result.ok ? "sampled" : "error" },
-        { "stream tokens", result.ok ? "live response" : "-", result.ok ? "sampled" : "error" }
-    };
+}
+
+static void ResetStreamingMessages(AppState& app, const std::string& model)
+{
+    if (app.streaming_model == model)
+        return;
+    app.streaming_model = model;
+    app.streaming_reasoning_message = -1;
+    app.streaming_response_message = -1;
+}
+
+static void ApplyStreamingDelta(AppState& app, const LlamaRunResult& result)
+{
+    ResetStreamingMessages(app, result.model);
+    if (!result.reasoning_delta.empty())
+    {
+        if (app.streaming_reasoning_message < 0)
+        {
+            AddMessage(app, result.model + " reasoning", {}, true, false, "streaming reasoning from llama.cpp");
+            app.streaming_reasoning_message = static_cast<int>(app.messages.size() - 1);
+        }
+        app.messages[static_cast<size_t>(app.streaming_reasoning_message)].text += result.reasoning_delta;
+    }
+    if (!result.delta.empty())
+    {
+        if (app.streaming_response_message < 0)
+        {
+            AddMessage(app, result.model, {}, true, false, "streaming from llama.cpp");
+            app.streaming_response_message = static_cast<int>(app.messages.size() - 1);
+        }
+        app.messages[static_cast<size_t>(app.streaming_response_message)].text += result.delta;
+    }
+}
+
+static void FinalizeStreamingMessages(AppState& app, const LlamaRunResult& result)
+{
+    ResetStreamingMessages(app, result.model);
+    const std::string annotation = "llama.cpp; prompt " + FormatRate(result.prompt_tokens_per_second) + "; decode " + FormatRate(result.decode_tokens_per_second);
+    if (!result.reasoning.empty())
+    {
+        if (app.streaming_reasoning_message < 0)
+        {
+            AddMessage(app, result.model + " reasoning", result.reasoning, true, false, "llama.cpp reasoning content");
+            app.streaming_reasoning_message = static_cast<int>(app.messages.size() - 1);
+        }
+        else
+        {
+            Message& reasoning = app.messages[static_cast<size_t>(app.streaming_reasoning_message)];
+            reasoning.text = result.reasoning;
+            reasoning.annotation = "llama.cpp reasoning content";
+        }
+    }
+
+    const bool response_is_reasoning_fallback = !result.text.empty() && result.text == result.reasoning && !result.reasoning.empty();
+    if (!result.text.empty() && !response_is_reasoning_fallback)
+    {
+        if (app.streaming_response_message < 0)
+        {
+            AddMessage(app, result.model, result.text, true, false, annotation);
+            app.streaming_response_message = static_cast<int>(app.messages.size() - 1);
+        }
+        else
+        {
+            Message& response = app.messages[static_cast<size_t>(app.streaming_response_message)];
+            response.text = result.text;
+            response.annotation = annotation;
+        }
+    }
+    else if (app.streaming_response_message >= 0)
+    {
+        Message& response = app.messages[static_cast<size_t>(app.streaming_response_message)];
+        response.text = result.text;
+        response.annotation = annotation;
+    }
 }
 
 static void ToggleModel(AppState& app, size_t index)
@@ -478,8 +621,6 @@ static void ToggleModel(AppState& app, size_t index)
         return;
     }
     app.models[index].selected = !app.models[index].selected;
-    if (app.models[index].selected)
-        app.active_model = app.models[index].name;
     ResetTelemetry(app);
     const size_t count = SelectedModelCount(app);
     ShowToast(app, std::to_string(count) + " model" + (count == 1 ? "" : "s") + " selected");
@@ -490,7 +631,7 @@ static void ClearPlayground(AppState& app, bool announce)
     if (app.run_busy)
         return;
     app.messages.clear();
-    AddMessage(app, "Renaro", "Select one or more local GGUF models, then run the same prompt against each model to compare output and timings.", false, true);
+    AddMessage(app, "Renaro", "Import one or more local GGUF models, select the files you want to compare, then run the same prompt against each model.", false, true);
     std::fill_n(app.prompt, sizeof(app.prompt), '\0');
     ResetTelemetry(app);
     app.pane = Pane::Playground;
@@ -516,16 +657,25 @@ static void StartRun(AppState& app, const std::string& submitted_prompt)
 
     const std::string trimmed_prompt = TrimCopy(submitted_prompt);
     const std::string prompt = trimmed_prompt.empty() ? "Explain the tradeoff between context length and decode speed." : trimmed_prompt;
+    ResetTelemetry(app);
     AddMessage(app, "You", prompt, false, false);
     app.pane = Pane::Playground;
-    app.telemetry_sampled = false;
     LlamaRunConfig config;
     config.server_path = app.server_path;
     config.context = app.context;
     config.temperature = app.temperature;
+    config.max_tokens = app.max_tokens;
     config.threads = app.threads;
+    config.threads_batch = app.threads_batch;
     config.gpu_layers = app.gpu_layers;
+    config.batch_size = app.batch_size;
+    config.ubatch_size = app.ubatch_size;
     config.seed = app.seed;
+    config.flash_attention = app.flash_attention;
+    config.cache_prompt = app.cache_prompt;
+    config.mmap = app.mmap;
+    config.mlock = app.mlock;
+    config.kv_offload = app.kv_offload;
     std::string error;
     if (!app.backend.StartComparison(jobs, prompt, config, error))
     {
@@ -544,15 +694,26 @@ static void AdvanceBackend(AppState& app, float delta_time)
     while (app.backend.PopResult(result))
     {
         received_result = true;
+        if (result.partial)
+        {
+            app.latest_result = result;
+            app.has_latest_result = true;
+            ApplyStreamingDelta(app, result);
+            continue;
+        }
+
+        app.latest_result = result;
+        app.has_latest_result = true;
         app.comparison_results.push_back(result);
+        AppendRunTrace(app, result);
         if (result.ok)
         {
-            const std::string annotation = "llama.cpp  /  prompt " + FormatRate(result.prompt_tokens_per_second) + "  /  decode " + FormatRate(result.decode_tokens_per_second);
-            AddMessage(app, result.model, result.text, true, false, annotation);
+            FinalizeStreamingMessages(app, result);
             SampleTelemetry(app, result);
         }
         else
         {
+            ResetStreamingMessages(app, result.model);
             AddMessage(app, result.model, "Run failed: " + result.error, true, false, "llama.cpp adapter error");
         }
     }
@@ -674,27 +835,25 @@ static void DrawSidebar(AppState& app, float time)
     ImGui::Dummy(ImVec2(0.0f, 26.0f));
     ImGui::TextColored(kMuted, "WORKSPACE");
 
-    struct NavItem { Pane pane; const char* mark; const char* label; const char* key; };
+    struct NavItem { Pane pane; const char* label; };
     const NavItem nav_items[] = {
-        { Pane::Playground, ">", "Playground", "1" },
-        { Pane::Diagnostics, "#", "Diagnostics", "2" },
-        { Pane::Trace, "=", "Trace log", "3" },
-        { Pane::Settings, "/", "Settings", "4" }
+        { Pane::Playground, "Playground" },
+        { Pane::Diagnostics, "Diagnostics" },
+        { Pane::Trace, "Trace log" },
+        { Pane::Settings, "Settings" }
     };
 
-    for (const NavItem& item : nav_items)
+    for (size_t index = 0; index < IM_ARRAYSIZE(nav_items); ++index)
     {
+        const NavItem& item = nav_items[index];
         const bool active = app.pane == item.pane;
-        ImGui::PushID(item.label);
+        ImGui::PushID(static_cast<int>(index));
         ImGui::PushStyleColor(ImGuiCol_Button, active ? ImVec4(0.120f, 0.230f, 0.380f, 1.0f) : ImVec4(0, 0, 0, 0));
         ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.120f, 0.185f, 0.290f, 1.0f));
         ImGui::PushStyleColor(ImGuiCol_Text, active ? kBlueBright : kInkSoft);
-        const float shortcut_width = 30.0f;
-        if (ImGui::Button((std::string(item.mark) + "  " + item.label).c_str(), ImVec2(std::max(80.0f, ImGui::GetContentRegionAvail().x - shortcut_width), 34.0f)))
+        if (ImGui::Button(item.label, ImVec2(-1.0f, 34.0f)))
             app.pane = item.pane;
         ImGui::PopStyleColor(3);
-        ImGui::SameLine(0.0f, 3.0f);
-        ImGui::TextColored(active ? kBlue : kMuted, "[%s]", item.key);
         ImGui::PopID();
     }
 
@@ -718,7 +877,7 @@ static void DrawSidebar(AppState& app, float time)
 static void DrawTopBar(AppState& app, float time)
 {
     ImGui::BeginChild("##TopBar", ImVec2(0.0f, 74.0f), ImGuiChildFlags_None, ImGuiWindowFlags_NoScrollbar);
-    ImGui::TextColored(kMuted, "LOCAL INFERENCE  /  WORKSPACE");
+    ImGui::TextColored(kMuted, "LOCAL INFERENCE");
     ImGui::TextColored(kInk, "Model bench");
 
     const float action_width = 322.0f;
@@ -748,6 +907,12 @@ static void DrawModelShelf(AppState& app)
     ImGui::SameLine(ImGui::GetWindowWidth() - 82.0f);
     ImGui::TextColored(kBlueBright, "%zu selected", SelectedModelCount(app));
     ImGui::Dummy(ImVec2(0.0f, 10.0f));
+    if (app.models.empty())
+    {
+        ImGui::TextColored(kInkSoft, "No models imported");
+        ImGui::TextWrapped("Add one or more GGUF files below. The library only shows files you attach to this playground.");
+        ImGui::Dummy(ImVec2(0.0f, 6.0f));
+    }
 
     ImGui::BeginDisabled(app.run_busy);
     if (QuietButton("Select all", ImVec2(82.0f, 28.0f)))
@@ -781,7 +946,7 @@ static void DrawModelShelf(AppState& app)
         ImGui::PushStyleColor(ImGuiCol_Button, active ? ImVec4(0.120f, 0.230f, 0.380f, 1.0f) : kPanelDeep);
         ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.145f, 0.250f, 0.390f, 1.0f));
         const float status_width = 52.0f;
-        if (ImGui::Button((std::string(active ? "[x] " : "[ ] ") + model.name).c_str(), ImVec2(std::max(90.0f, ImGui::GetContentRegionAvail().x - status_width), 34.0f)))
+        if (ImGui::Button(model.name.c_str(), ImVec2(std::max(90.0f, ImGui::GetContentRegionAvail().x - status_width), 34.0f)))
             ToggleModel(app, index);
         ImGui::PopStyleColor(2);
         ImGui::SameLine(0.0f, 6.0f);
@@ -802,16 +967,21 @@ static void DrawModelShelf(AppState& app)
             app.imported_path = WideToUtf8(path.wstring());
             if (!name.empty())
             {
-                auto existing = std::find_if(app.models.begin(), app.models.end(), [&name](const ModelEntry& item) { return item.name == name; });
+                auto existing = std::find_if(app.models.begin(), app.models.end(), [&selected_path](const ModelEntry& item) { return item.path == selected_path; });
                 if (existing == app.models.end())
-                    app.models.push_back({ name, "local file  /  ready", selected_path, true });
+                {
+                    std::string display_name = name;
+                    int duplicate_index = 2;
+                    while (std::any_of(app.models.begin(), app.models.end(), [&display_name](const ModelEntry& item) { return item.name == display_name; }))
+                        display_name = name + " (" + std::to_string(duplicate_index++) + ")";
+                    app.models.push_back({ display_name, "local file, ready", selected_path, true });
+                }
                 else
                 {
                     existing->path = selected_path;
-                    existing->detail = "local file  /  ready";
+                    existing->detail = "local file, ready";
                     existing->selected = true;
                 }
-                app.active_model = name;
                 ResetTelemetry(app);
             }
             ShowToast(app, "Added " + name + " to the comparison set");
@@ -831,6 +1001,298 @@ static void DrawModelShelf(AppState& app)
     ImGui::TextWrapped("One llama-server process is started per model so memory and token timings stay comparable.");
 }
 
+enum class MarkdownSpanStyle
+{
+    Normal,
+    Strong,
+    Emphasis,
+    Code,
+    Link,
+    Strike
+};
+
+struct MarkdownSpan
+{
+    std::string text;
+    MarkdownSpanStyle style = MarkdownSpanStyle::Normal;
+};
+
+static std::vector<MarkdownSpan> ParseMarkdownInline(const std::string& value)
+{
+    std::vector<MarkdownSpan> spans;
+    size_t cursor = 0;
+    size_t plain_start = 0;
+    const auto flush_plain = [&spans, &value, &plain_start](size_t end)
+    {
+        if (end > plain_start)
+            spans.push_back({ value.substr(plain_start, end - plain_start), MarkdownSpanStyle::Normal });
+    };
+    const auto flush_to = [&flush_plain, &cursor, &plain_start](size_t end)
+    {
+        flush_plain(end);
+        cursor = end;
+        plain_start = end;
+    };
+
+    while (cursor < value.size())
+    {
+        if (value[cursor] == '\\' && cursor + 1 < value.size())
+        {
+            cursor += 2;
+            continue;
+        }
+
+        const char* delimiter = nullptr;
+        MarkdownSpanStyle style = MarkdownSpanStyle::Normal;
+        size_t delimiter_length = 0;
+        if (value.compare(cursor, 2, "**") == 0 || value.compare(cursor, 2, "__") == 0)
+        {
+            delimiter = value.c_str() + cursor;
+            style = MarkdownSpanStyle::Strong;
+            delimiter_length = 2;
+        }
+        else if (value.compare(cursor, 2, "~~") == 0)
+        {
+            delimiter = value.c_str() + cursor;
+            style = MarkdownSpanStyle::Strike;
+            delimiter_length = 2;
+        }
+        else if (value[cursor] == '`')
+        {
+            delimiter = value.c_str() + cursor;
+            style = MarkdownSpanStyle::Code;
+            delimiter_length = 1;
+        }
+        else if (value[cursor] == '*')
+        {
+            delimiter = value.c_str() + cursor;
+            style = MarkdownSpanStyle::Emphasis;
+            delimiter_length = 1;
+        }
+        else if (value[cursor] == '_' && (cursor == 0 || value[cursor - 1] != '\\'))
+        {
+            delimiter = value.c_str() + cursor;
+            style = MarkdownSpanStyle::Emphasis;
+            delimiter_length = 1;
+        }
+        else if (value[cursor] == '[')
+        {
+            const size_t label_end = value.find("](", cursor + 1);
+            const size_t link_end = label_end == std::string::npos ? std::string::npos : value.find(')', label_end + 2);
+            if (label_end != std::string::npos && link_end != std::string::npos)
+            {
+                flush_to(cursor);
+                spans.push_back({ value.substr(cursor + 1, label_end - cursor - 1), MarkdownSpanStyle::Link });
+                cursor = link_end + 1;
+                plain_start = cursor;
+                continue;
+            }
+        }
+
+        if (!delimiter)
+        {
+            ++cursor;
+            continue;
+        }
+
+        const std::string token(delimiter, delimiter_length);
+        const size_t closing = value.find(token, cursor + delimiter_length);
+        if (closing == std::string::npos || closing == cursor + delimiter_length)
+        {
+            ++cursor;
+            continue;
+        }
+        flush_to(cursor);
+        spans.push_back({ value.substr(cursor + delimiter_length, closing - cursor - delimiter_length), style });
+        cursor = closing + delimiter_length;
+        plain_start = cursor;
+    }
+    flush_plain(value.size());
+    if (spans.empty())
+        spans.push_back({ value, MarkdownSpanStyle::Normal });
+    return spans;
+}
+
+static void DrawMarkdownInline(const std::string& value)
+{
+    const std::vector<MarkdownSpan> spans = ParseMarkdownInline(value);
+    if (spans.size() == 1 && spans.front().style == MarkdownSpanStyle::Normal)
+    {
+        ImGui::TextWrapped("%s", spans.front().text.c_str());
+        return;
+    }
+
+    bool first = true;
+    for (const MarkdownSpan& span : spans)
+    {
+        if (span.text.empty())
+            continue;
+        if (!first)
+            ImGui::SameLine(0.0f, 0.0f);
+        first = false;
+        switch (span.style)
+        {
+        case MarkdownSpanStyle::Strong:
+            ImGui::PushFont(g_font_bold);
+            ImGui::TextColored(kInk, "%s", span.text.c_str());
+            ImGui::PopFont();
+            break;
+        case MarkdownSpanStyle::Emphasis:
+            ImGui::TextColored(kInkSoft, "%s", span.text.c_str());
+            break;
+        case MarkdownSpanStyle::Code:
+            ImGui::PushFont(g_font_mono);
+            ImGui::TextColored(kBlueBright, "%s", span.text.c_str());
+            ImGui::PopFont();
+            break;
+        case MarkdownSpanStyle::Link:
+            ImGui::TextColored(kBlueBright, "%s", span.text.c_str());
+            ImGui::GetWindowDrawList()->AddLine(ImVec2(ImGui::GetItemRectMin().x, ImGui::GetItemRectMax().y - 1.0f), ImGui::GetItemRectMax(), ImGui::GetColorU32(kBlueBright));
+            break;
+        case MarkdownSpanStyle::Strike:
+            ImGui::TextColored(kMuted, "%s", span.text.c_str());
+            ImGui::GetWindowDrawList()->AddLine(ImVec2(ImGui::GetItemRectMin().x, (ImGui::GetItemRectMin().y + ImGui::GetItemRectMax().y) * 0.5f), ImVec2(ImGui::GetItemRectMax().x, (ImGui::GetItemRectMin().y + ImGui::GetItemRectMax().y) * 0.5f), ImGui::GetColorU32(kMuted));
+            break;
+        case MarkdownSpanStyle::Normal:
+        default:
+            ImGui::TextColored(kInkSoft, "%s", span.text.c_str());
+            break;
+        }
+    }
+    if (first)
+        ImGui::TextUnformatted("");
+}
+
+static bool IsMarkdownRule(const std::string& value)
+{
+    const std::string trimmed = TrimCopy(value);
+    if (trimmed.size() < 3)
+        return false;
+    const char marker = trimmed.front();
+    if (marker != '-' && marker != '*' && marker != '_')
+        return false;
+    return std::all_of(trimmed.begin(), trimmed.end(), [marker](char character) { return character == marker || character == ' '; });
+}
+
+static void DrawMarkdownCodeBlock(const std::string& code, const std::string& language, int block_index)
+{
+    const int line_count = static_cast<int>(std::count(code.begin(), code.end(), '\n')) + 1;
+    const float height = std::min(280.0f, std::max(54.0f, 24.0f + line_count * ImGui::GetTextLineHeightWithSpacing()));
+    const std::string child_id = "##MarkdownCode" + std::to_string(block_index);
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, kPanelDeep);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(12.0f, 10.0f));
+    ImGui::BeginChild(child_id.c_str(), ImVec2(-1.0f, height), ImGuiChildFlags_Borders, ImGuiWindowFlags_HorizontalScrollbar | ImGuiWindowFlags_NoSavedSettings);
+    if (!language.empty())
+        ImGui::TextColored(kMuted, "%s", language.c_str());
+    ImGui::PushFont(g_font_mono);
+    ImGui::TextUnformatted(code.c_str());
+    ImGui::PopFont();
+    ImGui::EndChild();
+    ImGui::PopStyleVar();
+    ImGui::PopStyleColor();
+}
+
+static void DrawMarkdown(const std::string& markdown)
+{
+    std::istringstream lines(markdown);
+    std::string line;
+    std::string code;
+    std::string language;
+    bool in_code = false;
+    int code_index = 0;
+    while (std::getline(lines, line))
+    {
+        if (!line.empty() && line.back() == '\r')
+            line.pop_back();
+        const std::string trimmed = TrimCopy(line);
+        if (trimmed.rfind("```", 0) == 0)
+        {
+            if (in_code)
+            {
+                DrawMarkdownCodeBlock(code, language, code_index++);
+                code.clear();
+                language.clear();
+                in_code = false;
+            }
+            else
+            {
+                language = TrimCopy(trimmed.substr(3));
+                in_code = true;
+            }
+            continue;
+        }
+        if (in_code)
+        {
+            if (!code.empty())
+                code.push_back('\n');
+            code += line;
+            continue;
+        }
+        if (trimmed.empty())
+        {
+            ImGui::Dummy(ImVec2(0.0f, 4.0f));
+            continue;
+        }
+        if (IsMarkdownRule(trimmed))
+        {
+            ImGui::Separator();
+            continue;
+        }
+
+        size_t heading_level = 0;
+        while (heading_level < trimmed.size() && heading_level < 3 && trimmed[heading_level] == '#')
+            ++heading_level;
+        if (heading_level > 0 && heading_level < trimmed.size() && trimmed[heading_level] == ' ')
+        {
+            ImGui::PushFont(g_font_bold);
+            ImGui::TextColored(heading_level == 1 ? kBlueBright : kInk, "%s", trimmed.substr(heading_level + 1).c_str());
+            ImGui::PopFont();
+            ImGui::Dummy(ImVec2(0.0f, heading_level == 1 ? 4.0f : 2.0f));
+            continue;
+        }
+
+        if (trimmed.front() == '>')
+        {
+            ImGui::TextColored(kBlue, "|");
+            ImGui::SameLine(0.0f, 8.0f);
+            ImGui::PushStyleColor(ImGuiCol_Text, kInkSoft);
+            DrawMarkdownInline(TrimCopy(trimmed.substr(1)));
+            ImGui::PopStyleColor();
+            continue;
+        }
+
+        size_t list_offset = std::string::npos;
+        std::string list_marker;
+        if (trimmed.rfind("- ", 0) == 0 || trimmed.rfind("* ", 0) == 0 || trimmed.rfind("+ ", 0) == 0)
+        {
+            list_offset = 2;
+            list_marker = "-";
+        }
+        else
+        {
+            size_t digit_end = 0;
+            while (digit_end < trimmed.size() && std::isdigit(static_cast<unsigned char>(trimmed[digit_end])))
+                ++digit_end;
+            if (digit_end > 0 && digit_end + 1 < trimmed.size() && trimmed[digit_end] == '.' && trimmed[digit_end + 1] == ' ')
+            {
+                list_offset = digit_end + 2;
+                list_marker = trimmed.substr(0, digit_end + 1);
+            }
+        }
+        if (list_offset != std::string::npos)
+        {
+            ImGui::TextColored(kBlueBright, "%s", list_marker.c_str());
+            ImGui::SameLine(0.0f, 8.0f);
+            DrawMarkdownInline(trimmed.substr(list_offset));
+            continue;
+        }
+
+        DrawMarkdownInline(line);
+    }
+    if (in_code)
+        DrawMarkdownCodeBlock(code, language, code_index);
+}
+
 static void DrawMessage(const Message& message)
 {
     const ImVec4 role_color = message.system ? kBlueBright : (message.assistant ? kBlue : kInk);
@@ -840,10 +1302,10 @@ static void DrawMessage(const Message& message)
         ImGui::TextColored(role_color, "%s", message.role.c_str());
     ImGui::SameLine(0.0f, 10.0f);
     ImGui::TextColored(kMuted, "%s", message.system ? "ready" : "now");
-    ImGui::TextWrapped("%s", message.text.c_str());
+    DrawMarkdown(message.text);
     if (!message.annotation.empty())
     {
-        ImGui::TextColored(kMuted, "----  %s", message.annotation.c_str());
+        ImGui::TextColored(kMuted, "%s", message.annotation.c_str());
     }
     ImGui::Dummy(ImVec2(0.0f, 7.0f));
 }
@@ -862,14 +1324,20 @@ static void DrawConversation(AppState& app)
 {
     const float prompt_height = 137.0f;
     ImGui::BeginChild("##ConversationScroll", ImVec2(0.0f, -prompt_height), ImGuiChildFlags_None, ImGuiWindowFlags_AlwaysVerticalScrollbar);
-    for (const Message& message : app.messages)
-        DrawMessage(message);
+    for (size_t index = 0; index < app.messages.size(); ++index)
+    {
+        ImGui::PushID(static_cast<int>(index));
+        DrawMessage(app.messages[index]);
+        ImGui::PopID();
+    }
     if (app.run_busy)
     {
         ImGui::TextColored(kBlueBright, "%zu selected models", SelectedModelCount(app));
         ImGui::SameLine(0.0f, 10.0f);
         ImGui::TextColored(kMuted, "%s", app.backend.Status().c_str());
         ImGui::TextColored(kBlue, "|  |  |  |  |  |  |  |  |  |  |  |");
+        if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 48.0f)
+            ImGui::SetScrollHereY(1.0f);
     }
     ImGui::EndChild();
 
@@ -880,10 +1348,10 @@ static void DrawConversation(AppState& app)
     ImGui::InputTextMultiline("##Prompt", app.prompt, sizeof(app.prompt), ImVec2(-1.0f, 70.0f), ImGuiInputTextFlags_AllowTabInput);
     const bool submit = ImGui::IsItemActive() && ImGui::IsKeyPressed(ImGuiKey_Enter) && !ImGui::GetIO().KeyShift;
     ImGui::PopStyleColor(3);
-    ImGui::TextColored(kMuted, "Enter sends  /  Shift+Enter adds a line");
+    ImGui::TextColored(kMuted, "Enter sends; Shift+Enter adds a line");
     ImGui::SameLine(ImGui::GetWindowWidth() - 135.0f);
     ImGui::BeginDisabled(app.run_busy);
-    if (PrimaryButton("Run selected", ImVec2(118.0f, 30.0f)) || submit)
+    if (PrimaryButton("Run selected##prompt", ImVec2(118.0f, 30.0f)) || submit)
         StartRun(app, app.prompt);
     ImGui::EndDisabled();
 }
@@ -892,21 +1360,26 @@ static void DrawDiagnostics(const AppState& app)
 {
     ImGui::TextColored(kBlueBright, "DIAGNOSTICS");
     ImGui::TextColored(kInk, "Run evidence");
-    ImGui::TextWrapped("Each result below is returned by llama.cpp. Select several local models to compare prompt throughput, decode speed, prompt evaluation time, and memory in one run.");
+    ImGui::TextWrapped("Each row is collected from llama.cpp, its optional slot endpoint, and the server process. Use this surface to compare token counts, timing, memory, CPU, cache, and response metadata per model.");
     ImGui::Dummy(ImVec2(0.0f, 14.0f));
     if (app.comparison_results.empty())
     {
         ImGui::TextColored(kMuted, "Diagnostics begin with the first llama.cpp run.");
         return;
     }
-    if (ImGui::BeginTable("##ComparisonTable", 6, ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_ScrollX))
+    if (ImGui::BeginTable("##ComparisonTable", 11, ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_ScrollX))
     {
         ImGui::TableSetupColumn("model");
         ImGui::TableSetupColumn("status");
-        ImGui::TableSetupColumn("prompt tok/s");
-        ImGui::TableSetupColumn("decode tok/s");
-        ImGui::TableSetupColumn("prompt eval");
+        ImGui::TableSetupColumn("prompt tokens per second");
+        ImGui::TableSetupColumn("decode tokens per second");
+        ImGui::TableSetupColumn("prompt tok");
+        ImGui::TableSetupColumn("generated tok");
+        ImGui::TableSetupColumn("prompt ms");
+        ImGui::TableSetupColumn("decode ms");
+        ImGui::TableSetupColumn("request");
         ImGui::TableSetupColumn("memory");
+        ImGui::TableSetupColumn("finish");
         ImGui::TableHeadersRow();
         for (const LlamaRunResult& result : app.comparison_results)
         {
@@ -920,11 +1393,75 @@ static void DrawDiagnostics(const AppState& app)
             ImGui::TableSetColumnIndex(3);
             ImGui::TextColored(kInkSoft, "%s", FormatRate(result.decode_tokens_per_second).c_str());
             ImGui::TableSetColumnIndex(4);
-            ImGui::TextColored(kInkSoft, "%s", FormatSeconds(result.prompt_eval_seconds).c_str());
+            ImGui::TextColored(kInkSoft, "%s", FormatCount(result.prompt_tokens).c_str());
             ImGui::TableSetColumnIndex(5);
+            ImGui::TextColored(kInkSoft, "%s", FormatCount(result.predicted_tokens).c_str());
+            ImGui::TableSetColumnIndex(6);
+            ImGui::TextColored(kInkSoft, "%s", FormatMilliseconds(result.prompt_ms).c_str());
+            ImGui::TableSetColumnIndex(7);
+            ImGui::TextColored(kInkSoft, "%s", FormatMilliseconds(result.predicted_ms).c_str());
+            ImGui::TableSetColumnIndex(8);
+            ImGui::TextColored(kInkSoft, "%s", FormatSeconds(result.request_seconds).c_str());
+            ImGui::TableSetColumnIndex(9);
             ImGui::TextColored(kInkSoft, "%s", FormatMemory(result.memory_gb).c_str());
+            ImGui::TableSetColumnIndex(10);
+            ImGui::TextColored(kInkSoft, "%s", result.ok ? result.finish_reason.c_str() : "error");
         }
         ImGui::EndTable();
+    }
+
+    if (app.has_latest_result)
+    {
+        const LlamaRunResult& result = app.latest_result;
+        ImGui::Dummy(ImVec2(0.0f, 14.0f));
+        ImGui::Separator();
+        ImGui::Dummy(ImVec2(0.0f, 8.0f));
+        ImGui::TextColored(kMuted, "LATEST RESPONSE DETAIL");
+        ImGui::TextColored(kInk, "%s", result.model.c_str());
+        ImGui::Dummy(ImVec2(0.0f, 6.0f));
+        if (ImGui::BeginTable("##LatestDetailTable", 2, ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp))
+        {
+            ImGui::TableSetupColumn("signal");
+            ImGui::TableSetupColumn("value");
+            ImGui::TableHeadersRow();
+            const auto detail = [](const char* label, const std::string& value)
+            {
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0);
+                ImGui::TextColored(kMuted, "%s", label);
+                ImGui::TableSetColumnIndex(1);
+                ImGui::TextWrapped("%s", value.c_str());
+            };
+            detail("response id", result.response_id.empty() ? "-" : result.response_id);
+            detail("response type", result.response_object.empty() ? "-" : result.response_object);
+            detail("server model", result.response_model);
+            detail("model alias", result.model_alias.empty() ? "-" : result.model_alias);
+            detail("model path", result.model_path.empty() ? "-" : result.model_path);
+            detail("build info", result.build_info.empty() ? "-" : result.build_info);
+            detail("chat template", result.chat_template.empty() ? "-" : result.chat_template);
+            detail("fingerprint", result.system_fingerprint.empty() ? "-" : result.system_fingerprint);
+            detail("HTTP status", std::to_string(result.http_status));
+            detail("timing source", result.timings_source);
+            detail("server load", FormatSeconds(result.server_load_seconds));
+            detail("request wall time", FormatSeconds(result.request_seconds));
+            detail("timing totals", FormatMilliseconds(result.total_ms) + ", load " + FormatMilliseconds(result.load_ms) + ", start " + FormatMilliseconds(result.start_ms));
+            detail("prompt eval", FormatMilliseconds(result.prompt_ms) + ", " + FormatRate(result.prompt_tokens_per_second) + ", " + FormatMilliseconds(result.prompt_ms_per_token) + " per token");
+            detail("decode", FormatMilliseconds(result.predicted_ms) + ", " + FormatRate(result.decode_tokens_per_second) + ", " + FormatMilliseconds(result.predicted_ms_per_token) + " per token");
+            detail("sampling", "tokenize " + FormatMilliseconds(result.tokenize_ms) + ", sample " + FormatMilliseconds(result.sample_ms));
+            detail("tokens", "prompt " + FormatCount(result.prompt_tokens) + ", generated " + FormatCount(result.predicted_tokens) + ", total " + FormatCount(result.total_tokens) + ", reasoning " + FormatCount(result.reasoning_tokens));
+            detail("prediction accounting", "accepted " + FormatCount(result.accepted_prediction_tokens) + ", rejected " + FormatCount(result.rejected_prediction_tokens));
+            detail("server config", "context " + FormatCount(result.context_size) + ", batch " + FormatCount(result.batch_size) + ", ubatch " + FormatCount(result.ubatch_size) + ", threads " + FormatCount(result.threads) + ", batch threads " + FormatCount(result.threads_batch) + ", GPU layers " + FormatCount(result.gpu_layers));
+            detail("context and cache", FormatCount(result.context_size) + ", cached " + FormatCount(result.tokens_cached) + ", reused " + (result.prompt_cache_reused ? "yes" : "no"));
+            detail("slot state", result.slot_info_available ? ("id " + std::to_string(result.slot_id) + ", " + (result.slot_state.empty() ? "unknown" : result.slot_state)) : "not exposed by server");
+            detail("slot counters", "past " + FormatCount(result.n_past) + ", prompt " + FormatCount(result.n_prompt_tokens) + ", decoded " + FormatCount(result.n_decoded) + ", cache " + FormatCount(result.n_cache_tokens) + ", limit " + FormatCount(result.n_predict_limit));
+            detail("stop flags", std::string(result.stopped_eos ? "EOS " : "") + (result.stopped_word ? "word " : "") + (result.stopped_limit ? "limit " : "") + (result.slot_truncated ? "truncated" : "none"));
+            detail("process CPU", FormatSeconds(result.cpu_seconds));
+            detail("memory", FormatMemory(result.memory_gb) + ", peak " + FormatMemory(result.peak_memory_gb) + ", private " + FormatMemory(result.private_memory_gb));
+            detail("response", FormatCount(result.response_bytes) + " bytes, finish " + result.finish_reason);
+            detail("metrics", result.metrics_available ? result.metrics_summary : "not exposed by server");
+            detail("metric time totals", "prompt " + FormatSeconds(result.metrics_prompt_seconds_total) + ", predicted " + FormatSeconds(result.metrics_predicted_seconds_total));
+            ImGui::EndTable();
+        }
     }
     for (const LlamaRunResult& result : app.comparison_results)
     {
@@ -936,23 +1473,35 @@ static void DrawDiagnostics(const AppState& app)
 static void DrawTrace(const AppState& app)
 {
     ImGui::TextColored(kBlueBright, "TRACE");
-    ImGui::TextColored(kInk, "Run sequence");
+    ImGui::TextColored(kInk, "Per-model run sequence");
+    ImGui::TextWrapped("Server startup, slot timing, token accounting, response status, and process resource snapshots are appended here for every model.");
     ImGui::Dummy(ImVec2(0.0f, 12.0f));
-    if (ImGui::BeginTable("##TraceTable", 3, ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp))
+    if (app.trace.empty())
     {
+        ImGui::TextColored(kMuted, "Trace entries appear after a llama.cpp run.");
+        return;
+    }
+    if (ImGui::BeginTable("##TraceTable", 5, ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_ScrollX))
+    {
+        ImGui::TableSetupColumn("model");
         ImGui::TableSetupColumn("event");
         ImGui::TableSetupColumn("duration");
         ImGui::TableSetupColumn("status");
+        ImGui::TableSetupColumn("detail");
         ImGui::TableHeadersRow();
         for (const TraceEntry& entry : app.trace)
         {
             ImGui::TableNextRow();
             ImGui::TableSetColumnIndex(0);
-            ImGui::TextColored(kInkSoft, "%s", entry.event.c_str());
+            ImGui::TextColored(kInk, "%s", entry.model.c_str());
             ImGui::TableSetColumnIndex(1);
-            ImGui::TextColored(kInk, "%s", entry.duration.c_str());
+            ImGui::TextColored(kInkSoft, "%s", entry.event.c_str());
             ImGui::TableSetColumnIndex(2);
-            ImGui::TextColored(app.telemetry_sampled ? kBlueBright : kMuted, "%s", entry.status.c_str());
+            ImGui::TextColored(kInk, "%s", entry.duration.c_str());
+            ImGui::TableSetColumnIndex(3);
+            ImGui::TextColored(entry.status == "error" ? kError : kBlueBright, "%s", entry.status.c_str());
+            ImGui::TableSetColumnIndex(4);
+            ImGui::TextWrapped("%s", entry.detail.c_str());
         }
         ImGui::EndTable();
     }
@@ -964,9 +1513,22 @@ static void DrawSettings(AppState& app)
     ImGui::TextColored(kInk, "Engine controls");
     ImGui::TextWrapped("These controls are passed to llama-server for every selected model. Models are run one at a time so the measurements stay comparable.");
     ImGui::Dummy(ImVec2(0.0f, 14.0f));
-    ImGui::SliderInt("Threads", &app.threads, 1, 32);
-    ImGui::SliderInt("GPU layers", &app.gpu_layers, 0, 64);
-    ImGui::SliderInt("Seed", &app.seed, 0, 9999);
+    ImGui::TextColored(kMuted, "REQUEST");
+    ImGui::SliderFloat("Temperature##settings", &app.temperature, 0.0f, 1.5f, "%.2f");
+    ImGui::SliderInt("Max output tokens##settings", &app.max_tokens, 16, 8192);
+    ImGui::Checkbox("Reuse prompt cache##settings", &app.cache_prompt);
+    ImGui::Dummy(ImVec2(0.0f, 8.0f));
+    ImGui::TextColored(kMuted, "SERVER RUNTIME");
+    ImGui::SliderInt("Threads##settings", &app.threads, 1, 64);
+    ImGui::SliderInt("Batch threads##settings", &app.threads_batch, 1, 64);
+    ImGui::SliderInt("GPU layers##settings", &app.gpu_layers, 0, 128);
+    ImGui::SliderInt("Batch size##settings", &app.batch_size, 32, 4096);
+    ImGui::SliderInt("Micro batch size##settings", &app.ubatch_size, 32, 4096);
+    ImGui::SliderInt("Seed##settings", &app.seed, 0, 9999);
+    ImGui::Checkbox("Flash attention##settings", &app.flash_attention);
+    ImGui::Checkbox("Memory map weights##settings", &app.mmap);
+    ImGui::Checkbox("Lock weights in memory##settings", &app.mlock);
+    ImGui::Checkbox("Keep KV cache on GPU##settings", &app.kv_offload);
     ImGui::Dummy(ImVec2(0.0f, 10.0f));
     ImGui::TextColored(kMuted, "LLAMA-SERVER BINARY");
     const std::string server_path = app.server_path.empty() ? "Not selected" : WideToUtf8(app.server_path);
@@ -997,7 +1559,7 @@ static void DrawWorkspace(AppState& app)
         : std::to_string(selected_count) + (selected_count == 1 ? " model selected" : " models selected");
     PanelHeading("MODEL COMPARISON", selected_label.c_str());
     ImGui::SameLine(0.0f, 8.0f);
-    ImGui::TextColored(kMuted, "/  same prompt, sequential runs");
+    ImGui::TextColored(kMuted, "same prompt, sequential runs");
     ImGui::SameLine(std::max(ImGui::GetCursorPosX(), ImGui::GetWindowWidth() - 235.0f));
     if (QuietButton("Copy run command", ImVec2(112.0f, 30.0f)))
     {
@@ -1007,7 +1569,7 @@ static void DrawWorkspace(AppState& app)
     }
     ImGui::SameLine(0.0f, 6.0f);
     ImGui::BeginDisabled(app.run_busy);
-    if (PrimaryButton("Run selected", ImVec2(112.0f, 30.0f)))
+    if (PrimaryButton("Run selected##header", ImVec2(112.0f, 30.0f)))
         StartRun(app, {});
     ImGui::EndDisabled();
 
@@ -1070,7 +1632,8 @@ static void DrawTelemetry(AppState& app)
 {
     PanelHeading("RUN TELEMETRY", "Signal");
     ImGui::SameLine(ImGui::GetWindowWidth() - 88.0f);
-    ImGui::TextColored(app.telemetry_sampled ? kBlueBright : kMuted, "%s", app.run_busy ? "sampling" : (app.telemetry_sampled ? "measured" : "waiting"));
+    const bool latest_error = app.has_latest_result && !app.latest_result.ok;
+    ImGui::TextColored(latest_error ? kError : (app.telemetry_sampled ? kBlueBright : kMuted), "%s", app.run_busy ? "sampling" : (latest_error ? "error" : (app.telemetry_sampled ? "measured" : "waiting")));
     ImGui::Dummy(ImVec2(0.0f, 10.0f));
 
     const std::string prompt_rate = FormatRate(app.prompt_tokens_per_second);
@@ -1081,14 +1644,55 @@ static void DrawTelemetry(AppState& app)
     {
         ImGui::TableNextRow();
         ImGui::TableSetColumnIndex(0);
-        DrawMetric("Prompt tok/s", prompt_rate.c_str(), app.telemetry_sampled ? "llama.cpp timing" : "run pending");
+        DrawMetric("Prompt tokens per second", prompt_rate.c_str(), app.telemetry_sampled ? "llama.cpp timing" : "run pending");
         ImGui::TableSetColumnIndex(1);
-        DrawMetric("Decode tok/s", decode_rate.c_str(), app.telemetry_sampled ? "llama.cpp timing" : "run pending");
+        DrawMetric("Decode tokens per second", decode_rate.c_str(), app.telemetry_sampled ? "llama.cpp timing" : "run pending");
         ImGui::TableNextRow();
         ImGui::TableSetColumnIndex(0);
         DrawMetric("Prompt eval", prompt_time.c_str(), app.telemetry_sampled ? "time before decode" : "not measured");
         ImGui::TableSetColumnIndex(1);
         DrawMetric("Memory", memory.c_str(), app.telemetry_sampled ? "server working set" : "not measured");
+        ImGui::EndTable();
+    }
+
+    ImGui::Dummy(ImVec2(0.0f, 12.0f));
+    ImGui::Separator();
+    ImGui::Dummy(ImVec2(0.0f, 10.0f));
+    ImGui::TextColored(kMuted, "LLAMA.CPP SIGNALS");
+    if (!app.has_latest_result)
+    {
+        ImGui::TextColored(kMuted, "Waiting for the first response.");
+    }
+    else if (ImGui::BeginTable("##LlamaSignalTable", 2, ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp))
+    {
+        ImGui::TableSetupColumn("signal");
+        ImGui::TableSetupColumn("value");
+        ImGui::TableHeadersRow();
+        const LlamaRunResult& result = app.latest_result;
+        const auto signal = [](const char* label, const std::string& value)
+        {
+            ImGui::TableNextRow();
+            ImGui::TableSetColumnIndex(0);
+            ImGui::TextColored(kMuted, "%s", label);
+            ImGui::TableSetColumnIndex(1);
+            ImGui::TextWrapped("%s", value.c_str());
+        };
+        signal("prompt tokens", FormatCount(result.prompt_tokens));
+        signal("generated tokens", FormatCount(result.predicted_tokens));
+        signal("total tokens", FormatCount(result.total_tokens));
+        signal("reasoning tokens", FormatCount(result.reasoning_tokens));
+        signal("prompt timing", FormatMilliseconds(result.prompt_ms) + ", " + FormatMilliseconds(result.prompt_ms_per_token) + " per token");
+        signal("decode timing", FormatMilliseconds(result.predicted_ms) + ", " + FormatMilliseconds(result.predicted_ms_per_token) + " per token");
+        signal("request wall", FormatSeconds(result.request_seconds));
+        signal("server load", FormatSeconds(result.server_load_seconds));
+        signal("context and cache", FormatCount(result.context_size) + ", " + FormatCount(result.tokens_cached) + (result.prompt_cache_reused ? ", reused" : ""));
+        signal("server config", "batch " + FormatCount(result.batch_size) + ", ubatch " + FormatCount(result.ubatch_size) + ", threads " + FormatCount(result.threads) + ", GPU " + FormatCount(result.gpu_layers));
+        signal("slot", result.slot_info_available ? (std::to_string(result.slot_id) + ", " + (result.slot_state.empty() ? "unknown" : result.slot_state)) : "not exposed");
+        signal("process CPU", FormatSeconds(result.cpu_seconds));
+        signal("working and peak", FormatMemory(result.memory_gb) + ", " + FormatMemory(result.peak_memory_gb));
+        signal("response", FormatCount(result.response_bytes) + " bytes, HTTP " + std::to_string(result.http_status));
+        signal("finish", result.finish_reason.empty() ? "-" : result.finish_reason);
+        signal("metrics", result.metrics_available ? result.metrics_summary : "not exposed");
         ImGui::EndTable();
     }
 
@@ -1239,7 +1843,7 @@ static void DrawCommandPalette(AppState& app)
         ImGui::PopID();
     }
     ImGui::Dummy(ImVec2(0.0f, 8.0f));
-    ImGui::TextColored(kMuted, "Ctrl+K open  /  Esc close  /  1-4 switch views");
+    ImGui::TextColored(kMuted, "Ctrl+K opens; Esc closes; 1-4 switch views");
     if (ImGui::IsKeyPressed(ImGuiKey_Escape))
         app.command_palette = false;
     ImGui::End();
@@ -1344,10 +1948,14 @@ int main(int, char**)
 
     if (::GetFileAttributesA("C:\\Windows\\Fonts\\segoeui.ttf") != INVALID_FILE_ATTRIBUTES)
         g_font_body = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\segoeui.ttf", 16.0f);
+    if (::GetFileAttributesA("C:\\Windows\\Fonts\\segoeuib.ttf") != INVALID_FILE_ATTRIBUTES)
+        g_font_bold = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\segoeuib.ttf", 16.0f);
     if (::GetFileAttributesA("C:\\Windows\\Fonts\\consola.ttf") != INVALID_FILE_ATTRIBUTES)
         g_font_mono = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\consola.ttf", 13.0f);
     if (!g_font_body)
         g_font_body = io.Fonts->AddFontDefault();
+    if (!g_font_bold)
+        g_font_bold = g_font_body;
     if (!g_font_mono)
         g_font_mono = g_font_body;
 
