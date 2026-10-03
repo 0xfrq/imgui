@@ -7,6 +7,7 @@
 #include "imgui.h"
 #include "imgui_impl_win32.h"
 #include "imgui_impl_dx11.h"
+#include "llama_backend.h"
 
 #include <windows.h>
 #include <commdlg.h>
@@ -105,6 +106,30 @@ static std::filesystem::path FindRenaroLogo()
     return {};
 }
 
+static std::filesystem::path FindLlamaServer()
+{
+    const std::filesystem::path relative = std::filesystem::path(L"llama-server.exe");
+    const std::filesystem::path executable = ExecutableDirectory();
+    const std::array<std::filesystem::path, 8> candidates = {
+        relative,
+        std::filesystem::path(L"tools") / relative,
+        std::filesystem::path(L"build") / L"bin" / relative,
+        executable / relative,
+        executable / L".." / relative,
+        executable / L".." / L".." / relative,
+        executable / L"tools" / relative,
+        executable / L".." / L"tools" / relative
+    };
+
+    for (const std::filesystem::path& candidate : candidates)
+    {
+        std::error_code error;
+        if (std::filesystem::exists(candidate, error))
+            return std::filesystem::absolute(candidate, error);
+    }
+    return {};
+}
+
 static bool LoadTextureFromFile(const std::filesystem::path& path, ID3D11ShaderResourceView** out_srv, int* out_width, int* out_height)
 {
     if (!out_srv || !g_pd3dDevice || path.empty())
@@ -188,11 +213,27 @@ static bool ChooseModelFile(std::wstring& selected_path)
     OPENFILENAMEW file_dialog = {};
     file_dialog.lStructSize = sizeof(file_dialog);
     file_dialog.hwndOwner = nullptr;
-    file_dialog.lpstrFilter = L"Model files (*.gguf;*.bin;*.safetensors)\0*.gguf;*.bin;*.safetensors\0All files (*.*)\0*.*\0";
+    file_dialog.lpstrFilter = L"GGUF model files (*.gguf)\0*.gguf\0All files (*.*)\0*.*\0";
     file_dialog.lpstrFile = buffer;
     file_dialog.nMaxFile = static_cast<DWORD>(sizeof(buffer) / sizeof(buffer[0]));
     file_dialog.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
     file_dialog.lpstrTitle = L"Import local model";
+    if (!::GetOpenFileNameW(&file_dialog))
+        return false;
+    selected_path = buffer;
+    return true;
+}
+
+static bool ChooseServerFile(std::wstring& selected_path)
+{
+    wchar_t buffer[4096] = {};
+    OPENFILENAMEW file_dialog = {};
+    file_dialog.lStructSize = sizeof(file_dialog);
+    file_dialog.lpstrFilter = L"llama-server executable (llama-server.exe)\0llama-server.exe\0Executable files (*.exe)\0*.exe\0All files (*.*)\0*.*\0";
+    file_dialog.lpstrFile = buffer;
+    file_dialog.nMaxFile = static_cast<DWORD>(sizeof(buffer) / sizeof(buffer[0]));
+    file_dialog.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+    file_dialog.lpstrTitle = L"Select llama-server.exe";
     if (!::GetOpenFileNameW(&file_dialog))
         return false;
     selected_path = buffer;
@@ -237,14 +278,11 @@ static std::string ModelSlug(const std::string& value)
     return result;
 }
 
-static std::string BuildRunCommand(const std::string& model, int context, float temperature, int threads = 8, int gpu_layers = 0, int seed = 42, bool use_prompt_cache = false)
+static std::string CommandModelArgument(const std::string& model)
 {
-    std::ostringstream command;
-    command << "renaro run --model " << ModelSlug(model) << " --ctx " << context << " --temp " << std::fixed << std::setprecision(2) << temperature;
-    command << " --threads " << threads << " --gpu-layers " << gpu_layers << " --seed " << seed;
-    if (use_prompt_cache)
-        command << " --prompt-cache";
-    return command.str();
+    if (model.find('\\') != std::string::npos || model.find('/') != std::string::npos || model.find(' ') != std::string::npos || model.find(':') != std::string::npos)
+        return "\"" + model + "\"";
+    return model;
 }
 
 enum class Pane
@@ -268,32 +306,27 @@ struct ModelEntry
 {
     std::string name;
     std::string detail;
-};
-
-struct SessionEntry
-{
-    std::string name;
-    std::string model;
-    std::string when;
+    std::wstring path;
+    bool selected = false;
 };
 
 struct TraceEntry
 {
-    const char* event;
-    const char* duration;
-    const char* status;
+    std::string event;
+    std::string duration;
+    std::string status;
 };
 
 struct AppState
 {
     Pane pane = Pane::Playground;
     std::vector<ModelEntry> models;
-    std::vector<SessionEntry> sessions;
     std::vector<Message> messages;
     std::vector<TraceEntry> trace;
-    std::string current_model;
-    std::string session_name;
+    std::vector<LlamaRunResult> comparison_results;
+    std::string active_model;
     std::string imported_path;
+    std::wstring server_path;
     std::string toast;
     char prompt[4096] = {};
     char command_search[256] = {};
@@ -302,34 +335,28 @@ struct AppState
     int threads = 8;
     int gpu_layers = 0;
     int seed = 42;
-    bool use_prompt_cache = false;
     bool telemetry_sampled = false;
-    bool simulation_busy = false;
-    float simulation_remaining = 0.0f;
+    double prompt_tokens_per_second = 0.0;
+    double decode_tokens_per_second = 0.0;
+    double prompt_eval_seconds = 0.0;
+    double memory_gb = 0.0;
+    bool run_busy = false;
     float toast_remaining = 0.0f;
     bool command_palette = false;
     bool command_focus_search = false;
+    LlamaServerBackend backend;
     std::array<float, 12> bars = { 0.26f, 0.42f, 0.34f, 0.58f, 0.49f, 0.72f, 0.62f, 0.84f, 0.74f, 0.94f, 0.79f, 0.68f };
 
     AppState()
     {
         models = {
-            { "Qwen3 8B", "8.2B  /  GGUF  /  ready" },
-            { "Llama 3.1 8B", "8.0B  /  GGUF  /  staged" },
-            { "Mistral Nemo", "12.2B  /  GGUF  /  staged" },
-            { "Gemma 3 12B", "12.2B  /  GGUF  /  staged" }
+            { "Qwen3 8B", "8.2B  /  GGUF  /  select a file", {}, false },
+            { "Llama 3.1 8B", "8.0B  /  GGUF  /  select a file", {}, false },
+            { "Mistral Nemo", "12.2B  /  GGUF  /  select a file", {}, false },
+            { "Gemma 3 12B", "12.2B  /  GGUF  /  select a file", {}, false }
         };
-        sessions = {
-            { "Untitled study", "Qwen3 8B", "just now" },
-            { "Repetition sweep", "Llama 3.1 8B", "yesterday" },
-            { "Context drift", "Mistral Nemo", "last week" }
-        };
-        current_model = models.front().name;
-        session_name = sessions.front().name;
         messages = {
-            { "System", "You are a local research assistant. State assumptions, show uncertainty, and keep the answer close to the evidence.", false, true, {} },
-            { "You", "Give me three hypotheses for why this prompt might increase repetition.", false, false, {} },
-            { "Qwen3 8B", "Start with the context window, sampling temperature, and the stop sequence. Hold the model constant, change one variable at a time, and record the decode trace.", true, false, "sample stream  /  llama.cpp adapter pending" }
+            { "Renaro", "Select one or more local GGUF models, then run the same prompt against each model to compare output and timings.", false, true, {} }
         };
         trace = {
             { "load context", "-", "pending" },
@@ -342,7 +369,24 @@ struct AppState
 
 static std::string CurrentRunCommand(const AppState& app)
 {
-    return BuildRunCommand(app.current_model, app.context, app.temperature, app.threads, app.gpu_layers, app.seed, app.use_prompt_cache);
+    const std::string server = app.server_path.empty() ? "llama-server.exe" : WideToUtf8(app.server_path);
+    for (const ModelEntry& model : app.models)
+    {
+        if (model.selected)
+        {
+            const std::string model_argument = model.path.empty() ? ModelSlug(model.name) : WideToUtf8(model.path);
+            std::ostringstream command;
+            command << CommandModelArgument(server) << " -m " << CommandModelArgument(model_argument)
+                    << " -c " << app.context
+                    << " --host 127.0.0.1 --port 8080"
+                    << " -t " << app.threads
+                    << " -ngl " << app.gpu_layers
+                    << " --seed " << app.seed
+                    << " --temp " << std::fixed << std::setprecision(2) << app.temperature;
+            return command.str();
+        }
+    }
+    return "llama-server.exe -m <select-a-model> -c " + std::to_string(app.context) + " --host 127.0.0.1 --port 8080";
 }
 
 static void ShowToast(AppState& app, const std::string& message)
@@ -359,6 +403,11 @@ static void AddMessage(AppState& app, const std::string& role, const std::string
 static void ResetTelemetry(AppState& app)
 {
     app.telemetry_sampled = false;
+    app.prompt_tokens_per_second = 0.0;
+    app.decode_tokens_per_second = 0.0;
+    app.prompt_eval_seconds = 0.0;
+    app.memory_gb = 0.0;
+    app.comparison_results.clear();
     app.bars = { 0.26f, 0.42f, 0.34f, 0.58f, 0.49f, 0.72f, 0.62f, 0.84f, 0.74f, 0.94f, 0.79f, 0.68f };
     for (TraceEntry& entry : app.trace)
     {
@@ -367,97 +416,151 @@ static void ResetTelemetry(AppState& app)
     }
 }
 
-static void SampleTelemetry(AppState& app)
+static size_t SelectedModelCount(const AppState& app)
 {
-    app.telemetry_sampled = true;
-    app.bars = { 0.36f, 0.48f, 0.43f, 0.68f, 0.57f, 0.78f, 0.67f, 0.90f, 0.80f, 0.96f, 0.86f, 0.76f };
+    return static_cast<size_t>(std::count_if(app.models.begin(), app.models.end(), [](const ModelEntry& model) { return model.selected; }));
+}
+
+static std::string FormatSeconds(double seconds)
+{
+    if (seconds <= 0.0)
+        return "-";
+    std::ostringstream value;
+    value << std::fixed << std::setprecision(2) << seconds << " s";
+    return value.str();
+}
+
+static std::string FormatRate(double rate)
+{
+    if (rate <= 0.0)
+        return "-";
+    std::ostringstream value;
+    value << std::fixed << std::setprecision(1) << rate << " tok/s";
+    return value.str();
+}
+
+static std::string FormatMemory(double gigabytes)
+{
+    if (gigabytes <= 0.0)
+        return "-";
+    std::ostringstream value;
+    value << std::fixed << std::setprecision(2) << gigabytes << " GB";
+    return value.str();
+}
+
+static void SampleTelemetry(AppState& app, const LlamaRunResult& result)
+{
+    app.telemetry_sampled = result.ok;
+    app.prompt_tokens_per_second = result.prompt_tokens_per_second;
+    app.decode_tokens_per_second = result.decode_tokens_per_second;
+    app.prompt_eval_seconds = result.prompt_eval_seconds;
+    app.memory_gb = result.memory_gb;
+    const float prompt_scale = std::clamp(static_cast<float>(result.prompt_tokens_per_second / 100.0), 0.12f, 0.98f);
+    const float decode_scale = std::clamp(static_cast<float>(result.decode_tokens_per_second / 50.0), 0.12f, 0.98f);
+    app.bars = { prompt_scale * 0.72f, prompt_scale * 0.88f, prompt_scale * 0.66f, decode_scale * 0.72f, decode_scale * 0.54f, decode_scale * 0.86f, decode_scale * 0.70f, decode_scale * 0.92f, decode_scale * 0.78f, decode_scale, decode_scale * 0.88f, decode_scale * 0.74f };
+    const std::string prompt_duration = FormatSeconds(result.prompt_eval_seconds);
+    const std::string decode_duration = FormatRate(result.decode_tokens_per_second);
     app.trace = {
-        { "load context", "0.14 s", "sampled" },
-        { "prefill", "0.31 s", "sampled" },
-        { "decode loop", "0.82 s", "sampled" },
-        { "stream tokens", "1.42 s", "sampled" }
+        { "load context", prompt_duration, result.ok ? "sampled" : "error" },
+        { "prefill", prompt_duration, result.ok ? "sampled" : "error" },
+        { "decode loop", decode_duration, result.ok ? "sampled" : "error" },
+        { "stream tokens", result.ok ? "live response" : "-", result.ok ? "sampled" : "error" }
     };
 }
 
-static void SelectModel(AppState& app, size_t index, bool announce)
+static void ToggleModel(AppState& app, size_t index)
 {
     if (index >= app.models.size())
         return;
-    app.current_model = app.models[index].name;
-    ResetTelemetry(app);
-    for (SessionEntry& session : app.sessions)
+    if (app.models[index].path.empty())
     {
-        if (session.name == app.session_name)
-        {
-            session.model = app.current_model;
-            session.when = "just now";
-        }
+        ShowToast(app, "Import a local model file for " + app.models[index].name);
+        return;
     }
-    if (announce)
-        ShowToast(app, app.current_model + " selected for this session");
+    app.models[index].selected = !app.models[index].selected;
+    if (app.models[index].selected)
+        app.active_model = app.models[index].name;
+    ResetTelemetry(app);
+    const size_t count = SelectedModelCount(app);
+    ShowToast(app, std::to_string(count) + " model" + (count == 1 ? "" : "s") + " selected");
 }
 
-static void StartNewSession(AppState& app, bool announce)
+static void ClearPlayground(AppState& app, bool announce)
 {
-    app.simulation_busy = false;
-    app.simulation_remaining = 0.0f;
-    app.session_name = "Untitled study";
+    if (app.run_busy)
+        return;
     app.messages.clear();
-    AddMessage(app, "System", "You are a local research assistant. State assumptions, show uncertainty, and keep the answer close to the evidence.", false, true);
-    app.sessions.front() = { "Untitled study", app.current_model, "just now" };
+    AddMessage(app, "Renaro", "Select one or more local GGUF models, then run the same prompt against each model to compare output and timings.", false, true);
+    std::fill_n(app.prompt, sizeof(app.prompt), '\0');
     ResetTelemetry(app);
     app.pane = Pane::Playground;
     if (announce)
-        ShowToast(app, "New session ready");
+        ShowToast(app, "Playground cleared");
 }
 
-static void ActivateSession(AppState& app, size_t index)
+static void StartRun(AppState& app, const std::string& submitted_prompt)
 {
-    if (index >= app.sessions.size())
+    if (app.run_busy)
         return;
-    const SessionEntry& session = app.sessions[index];
-    app.session_name = session.name;
-    for (size_t model_index = 0; model_index < app.models.size(); ++model_index)
+    std::vector<LlamaModelJob> jobs;
+    for (const ModelEntry& model : app.models)
     {
-        if (app.models[model_index].name == session.model)
+        if (model.selected)
+            jobs.push_back({ model.name, model.path });
+    }
+    if (jobs.empty())
+    {
+        ShowToast(app, "Select at least one model first");
+        return;
+    }
+
+    const std::string trimmed_prompt = TrimCopy(submitted_prompt);
+    const std::string prompt = trimmed_prompt.empty() ? "Explain the tradeoff between context length and decode speed." : trimmed_prompt;
+    AddMessage(app, "You", prompt, false, false);
+    app.pane = Pane::Playground;
+    app.telemetry_sampled = false;
+    LlamaRunConfig config;
+    config.server_path = app.server_path;
+    config.context = app.context;
+    config.temperature = app.temperature;
+    config.threads = app.threads;
+    config.gpu_layers = app.gpu_layers;
+    config.seed = app.seed;
+    std::string error;
+    if (!app.backend.StartComparison(jobs, prompt, config, error))
+    {
+        AddMessage(app, "Renaro", error, true, false, "llama.cpp adapter error");
+        ShowToast(app, error);
+        return;
+    }
+    app.run_busy = true;
+    std::fill_n(app.prompt, sizeof(app.prompt), '\0');
+}
+
+static void AdvanceBackend(AppState& app, float delta_time)
+{
+    LlamaRunResult result;
+    bool received_result = false;
+    while (app.backend.PopResult(result))
+    {
+        received_result = true;
+        app.comparison_results.push_back(result);
+        if (result.ok)
         {
-            app.current_model = session.model;
-            break;
+            const std::string annotation = "llama.cpp  /  prompt " + FormatRate(result.prompt_tokens_per_second) + "  /  decode " + FormatRate(result.decode_tokens_per_second);
+            AddMessage(app, result.model, result.text, true, false, annotation);
+            SampleTelemetry(app, result);
+        }
+        else
+        {
+            AddMessage(app, result.model, "Run failed: " + result.error, true, false, "llama.cpp adapter error");
         }
     }
-    ResetTelemetry(app);
-    app.pane = Pane::Playground;
-    ShowToast(app, "Opened " + app.session_name);
-}
-
-static void StartSimulation(AppState& app, const std::string& submitted_prompt)
-{
-    if (app.simulation_busy)
-        return;
-    const std::string prompt = TrimCopy(submitted_prompt);
-    const bool has_prompt = !prompt.empty();
-    if (has_prompt)
-        AddMessage(app, "You", prompt, false, false);
-    app.pane = Pane::Playground;
-    app.simulation_busy = true;
-    app.simulation_remaining = 0.78f;
-    app.telemetry_sampled = false;
-    if (has_prompt)
-        std::fill_n(app.prompt, sizeof(app.prompt), '\0');
-}
-
-static void AdvanceSimulation(AppState& app, float delta_time)
-{
-    if (app.simulation_busy)
+    if (app.run_busy && !app.backend.IsBusy())
     {
-        app.simulation_remaining -= delta_time;
-        if (app.simulation_remaining <= 0.0f)
-        {
-            AddMessage(app, app.current_model, "Staged response for the current prompt. Connect the llama.cpp adapter here to replace this sample with a live stream.", true, false, "staged sample  /  llama.cpp adapter pending");
-            app.simulation_busy = false;
-            SampleTelemetry(app);
-            ShowToast(app, "Staged telemetry sample ready");
-        }
+        app.run_busy = false;
+        if (received_result)
+            ShowToast(app, "llama.cpp comparison complete");
     }
     if (app.toast_remaining > 0.0f)
         app.toast_remaining = std::max(0.0f, app.toast_remaining - delta_time);
@@ -556,25 +659,19 @@ static void PanelHeading(const char* label, const char* title)
 
 static void DrawSidebar(AppState& app, float time)
 {
-    ImGui::BeginGroup();
+    const float logo_size = 96.0f;
+    ImGui::SetCursorPosX(std::max(0.0f, (ImGui::GetContentRegionAvail().x - logo_size) * 0.5f));
     if (g_logo_srv)
-        ImGui::Image((ImTextureID)(intptr_t)g_logo_srv, ImVec2(30.0f, 30.0f));
+        ImGui::Image((ImTextureID)(intptr_t)g_logo_srv, ImVec2(logo_size, logo_size));
     else
     {
-        ImGui::Dummy(ImVec2(30.0f, 30.0f));
+        ImGui::Dummy(ImVec2(logo_size, logo_size));
         ImDrawList* draw_list = ImGui::GetWindowDrawList();
         const ImVec2 min = ImGui::GetItemRectMin();
-        draw_list->AddRectFilled(min, min + ImVec2(30.0f, 30.0f), ImGui::GetColorU32(kBlue), 5.0f);
-        draw_list->AddText(min + ImVec2(9.0f, 5.0f), ImGui::GetColorU32(kBlueInk), "R");
+        draw_list->AddRectFilled(min, min + ImVec2(logo_size, logo_size), ImGui::GetColorU32(kBlue), 12.0f);
+        draw_list->AddText(min + ImVec2(42.0f, 32.0f), ImGui::GetColorU32(kBlueInk), "R");
     }
-    ImGui::SameLine(0.0f, 9.0f);
-    ImGui::BeginGroup();
-    ImGui::TextColored(kInk, "RENARO");
-    ImGui::TextColored(kBlueBright, "PLAYGROUND");
-    ImGui::EndGroup();
-    ImGui::EndGroup();
-
-    ImGui::Dummy(ImVec2(0.0f, 22.0f));
+    ImGui::Dummy(ImVec2(0.0f, 26.0f));
     ImGui::TextColored(kMuted, "WORKSPACE");
 
     struct NavItem { Pane pane; const char* mark; const char* label; const char* key; };
@@ -601,30 +698,7 @@ static void DrawSidebar(AppState& app, float time)
         ImGui::PopID();
     }
 
-    ImGui::Dummy(ImVec2(0.0f, 18.0f));
-    ImGui::Separator();
-    ImGui::Dummy(ImVec2(0.0f, 12.0f));
-    ImGui::TextColored(kMuted, "RECENT SESSIONS");
-    for (size_t index = 0; index < app.sessions.size(); ++index)
-    {
-        const SessionEntry& session = app.sessions[index];
-        const bool active = session.name == app.session_name;
-        ImGui::PushID(static_cast<int>(index));
-        ImGui::PushStyleColor(ImGuiCol_Header, active ? ImVec4(0.105f, 0.180f, 0.290f, 1.0f) : ImVec4(0, 0, 0, 0));
-        if (ImGui::Selectable(session.name.c_str(), active, ImGuiSelectableFlags_DontClosePopups, ImVec2(-1.0f, 30.0f)))
-            ActivateSession(app, index);
-        ImGui::PopStyleColor();
-        ImGui::Indent(17.0f);
-        ImGui::TextColored(kMuted, "%s  /  %s", session.model.c_str(), session.when.c_str());
-        ImGui::Unindent(17.0f);
-        ImGui::PopID();
-    }
-
-    ImGui::Dummy(ImVec2(0.0f, 12.0f));
-    if (QuietButton("+  New session", ImVec2(-1.0f, 32.0f)))
-        StartNewSession(app, true);
-
-    const float footer_height = 68.0f;
+    const float footer_height = 86.0f;
     const float footer_y = std::max(ImGui::GetCursorPosY(), ImGui::GetWindowHeight() - footer_height);
     ImGui::SetCursorPosY(footer_y);
     ImGui::Separator();
@@ -634,25 +708,26 @@ static void DrawSidebar(AppState& app, float time)
     ImGui::Dummy(ImVec2(14.0f, 16.0f));
     ImGui::SameLine(0.0f, 4.0f);
     ImGui::BeginGroup();
-    ImGui::TextColored(kInkSoft, "Local engine");
-    ImGui::TextColored(kMuted, "adapter not connected");
+    ImGui::TextColored(kInkSoft, "llama.cpp bridge");
+    ImGui::TextColored(kMuted, "%s", app.server_path.empty() ? "server path not set" : app.backend.Status().c_str());
     ImGui::EndGroup();
     ImGui::EndGroup();
-    ImGui::TextColored(kMuted, "v0.1 playground");
+    ImGui::TextColored(kMuted, "%zu model%s selected", SelectedModelCount(app), SelectedModelCount(app) == 1 ? "" : "s");
 }
 
 static void DrawTopBar(AppState& app, float time)
 {
     ImGui::BeginChild("##TopBar", ImVec2(0.0f, 74.0f), ImGuiChildFlags_None, ImGuiWindowFlags_NoScrollbar);
     ImGui::TextColored(kMuted, "LOCAL INFERENCE  /  WORKSPACE");
-    ImGui::TextColored(kInk, "Playground");
+    ImGui::TextColored(kInk, "Model bench");
 
-    const float action_width = 332.0f;
+    const float action_width = 322.0f;
     ImGui::SameLine(std::max(ImGui::GetCursorPosX(), ImGui::GetWindowWidth() - action_width));
-    DrawPulseDot(ImGui::GetCursorScreenPos() + ImVec2(5.0f, 10.0f), 3.0f, time, app.simulation_busy);
+    DrawPulseDot(ImGui::GetCursorScreenPos() + ImVec2(5.0f, 10.0f), 3.0f, time, app.run_busy);
     ImGui::Dummy(ImVec2(14.0f, 18.0f));
     ImGui::SameLine(0.0f, 4.0f);
-    ImGui::TextColored(app.simulation_busy ? kBlueBright : kMuted, "%s", app.simulation_busy ? "SIMULATING" : (app.telemetry_sampled ? "DEMO SAMPLE" : "READY FOR A RUN"));
+    const std::string status = app.run_busy ? app.backend.Status() : (app.telemetry_sampled ? "live sample" : "ready for a run");
+    ImGui::TextColored(app.run_busy ? kBlueBright : kMuted, "%s", status.c_str());
     ImGui::SameLine(0.0f, 16.0f);
     if (QuietButton("Find  Ctrl+K", ImVec2(92.0f, 30.0f)))
     {
@@ -660,29 +735,57 @@ static void DrawTopBar(AppState& app, float time)
         app.command_focus_search = true;
     }
     ImGui::SameLine(0.0f, 6.0f);
-    if (PrimaryButton("New session", ImVec2(112.0f, 30.0f)))
-        StartNewSession(app, true);
+    ImGui::BeginDisabled(app.run_busy);
+    if (QuietButton("Clear run", ImVec2(90.0f, 30.0f)))
+        ClearPlayground(app, true);
+    ImGui::EndDisabled();
     ImGui::EndChild();
 }
 
 static void DrawModelShelf(AppState& app)
 {
     PanelHeading("MODELS", "Library");
+    ImGui::SameLine(ImGui::GetWindowWidth() - 82.0f);
+    ImGui::TextColored(kBlueBright, "%zu selected", SelectedModelCount(app));
+    ImGui::Dummy(ImVec2(0.0f, 10.0f));
+
+    ImGui::BeginDisabled(app.run_busy);
+    if (QuietButton("Select all", ImVec2(82.0f, 28.0f)))
+    {
+        size_t attached_count = 0;
+        for (ModelEntry& model : app.models)
+        {
+            if (!model.path.empty())
+            {
+                model.selected = true;
+                ++attached_count;
+            }
+        }
+        ShowToast(app, attached_count == 0 ? "Import local model files first" : "All attached models selected");
+    }
+    ImGui::SameLine(0.0f, 6.0f);
+    if (QuietButton("Clear", ImVec2(70.0f, 28.0f)))
+    {
+        for (ModelEntry& model : app.models)
+            model.selected = false;
+        ResetTelemetry(app);
+        ShowToast(app, "Model selection cleared");
+    }
     ImGui::Dummy(ImVec2(0.0f, 10.0f));
 
     for (size_t index = 0; index < app.models.size(); ++index)
     {
         const ModelEntry& model = app.models[index];
-        const bool active = model.name == app.current_model;
+        const bool active = model.selected;
         ImGui::PushID(static_cast<int>(index));
         ImGui::PushStyleColor(ImGuiCol_Button, active ? ImVec4(0.120f, 0.230f, 0.380f, 1.0f) : kPanelDeep);
         ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.145f, 0.250f, 0.390f, 1.0f));
         const float status_width = 52.0f;
-        if (ImGui::Button((std::string(1, model.name.front()) + "  " + model.name).c_str(), ImVec2(std::max(90.0f, ImGui::GetContentRegionAvail().x - status_width), 34.0f)))
-            SelectModel(app, index, true);
+        if (ImGui::Button((std::string(active ? "[x] " : "[ ] ") + model.name).c_str(), ImVec2(std::max(90.0f, ImGui::GetContentRegionAvail().x - status_width), 34.0f)))
+            ToggleModel(app, index);
         ImGui::PopStyleColor(2);
         ImGui::SameLine(0.0f, 6.0f);
-        ImGui::TextColored(active ? kBlueBright : kMuted, "%s", active ? "active" : "staged");
+        ImGui::TextColored(active ? kBlueBright : kMuted, "%s", active ? "selected" : "staged");
         ImGui::TextColored(kMuted, "    %s", model.detail.c_str());
         ImGui::Dummy(ImVec2(0.0f, 4.0f));
         ImGui::PopID();
@@ -701,24 +804,31 @@ static void DrawModelShelf(AppState& app)
             {
                 auto existing = std::find_if(app.models.begin(), app.models.end(), [&name](const ModelEntry& item) { return item.name == name; });
                 if (existing == app.models.end())
-                    app.models.push_back({ name, "local file  /  staged import" });
-                const size_t index = static_cast<size_t>(std::distance(app.models.begin(), std::find_if(app.models.begin(), app.models.end(), [&name](const ModelEntry& item) { return item.name == name; })));
-                SelectModel(app, index, false);
+                    app.models.push_back({ name, "local file  /  ready", selected_path, true });
+                else
+                {
+                    existing->path = selected_path;
+                    existing->detail = "local file  /  ready";
+                    existing->selected = true;
+                }
+                app.active_model = name;
+                ResetTelemetry(app);
             }
-            ShowToast(app, "Selected " + name + " for the next import flow");
+            ShowToast(app, "Added " + name + " to the comparison set");
         }
     }
     if (!app.imported_path.empty())
     {
-        ImGui::TextColored(kBlueBright, "Ready to import");
+        ImGui::TextColored(kBlueBright, "Latest model file");
         ImGui::TextWrapped("%s", app.imported_path.c_str());
     }
+    ImGui::EndDisabled();
     ImGui::Dummy(ImVec2(0.0f, 12.0f));
     ImGui::Separator();
     ImGui::Dummy(ImVec2(0.0f, 8.0f));
-    ImGui::TextColored(kMuted, "MODEL DIRECTORY");
-    ImGui::TextColored(kInkSoft, "-  adapter path pending");
-    ImGui::TextWrapped("Choose a directory when the local engine adapter is connected.");
+    ImGui::TextColored(kMuted, "COMPARISON MODE");
+    ImGui::TextColored(kInkSoft, "Selected models run sequentially");
+    ImGui::TextWrapped("One llama-server process is started per model so memory and token timings stay comparable.");
 }
 
 static void DrawMessage(const Message& message)
@@ -754,11 +864,11 @@ static void DrawConversation(AppState& app)
     ImGui::BeginChild("##ConversationScroll", ImVec2(0.0f, -prompt_height), ImGuiChildFlags_None, ImGuiWindowFlags_AlwaysVerticalScrollbar);
     for (const Message& message : app.messages)
         DrawMessage(message);
-    if (app.simulation_busy)
+    if (app.run_busy)
     {
-        ImGui::TextColored(kBlueBright, "%s", app.current_model.c_str());
+        ImGui::TextColored(kBlueBright, "%zu selected models", SelectedModelCount(app));
         ImGui::SameLine(0.0f, 10.0f);
-        ImGui::TextColored(kMuted, "sampling...");
+        ImGui::TextColored(kMuted, "%s", app.backend.Status().c_str());
         ImGui::TextColored(kBlue, "|  |  |  |  |  |  |  |  |  |  |  |");
     }
     ImGui::EndChild();
@@ -772,9 +882,9 @@ static void DrawConversation(AppState& app)
     ImGui::PopStyleColor(3);
     ImGui::TextColored(kMuted, "Enter sends  /  Shift+Enter adds a line");
     ImGui::SameLine(ImGui::GetWindowWidth() - 135.0f);
-    ImGui::BeginDisabled(app.simulation_busy);
-    if (PrimaryButton("Send prompt", ImVec2(118.0f, 30.0f)) || submit)
-        StartSimulation(app, app.prompt);
+    ImGui::BeginDisabled(app.run_busy);
+    if (PrimaryButton("Run selected", ImVec2(118.0f, 30.0f)) || submit)
+        StartRun(app, app.prompt);
     ImGui::EndDisabled();
 }
 
@@ -782,36 +892,44 @@ static void DrawDiagnostics(const AppState& app)
 {
     ImGui::TextColored(kBlueBright, "DIAGNOSTICS");
     ImGui::TextColored(kInk, "Run evidence");
-    ImGui::TextWrapped("Tokenization, sampling, prompt-cache hits, and memory pressure stay beside the conversation so each run can be compared without leaving the workbench.");
+    ImGui::TextWrapped("Each result below is returned by llama.cpp. Select several local models to compare prompt throughput, decode speed, prompt evaluation time, and memory in one run.");
     ImGui::Dummy(ImVec2(0.0f, 14.0f));
-    if (!app.telemetry_sampled)
+    if (app.comparison_results.empty())
     {
-        ImGui::TextColored(kMuted, "Diagnostics begin with the first staged or real run.");
+        ImGui::TextColored(kMuted, "Diagnostics begin with the first llama.cpp run.");
         return;
     }
-    if (ImGui::BeginTable("##DiagnosticTable", 3, ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp))
+    if (ImGui::BeginTable("##ComparisonTable", 6, ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_ScrollX))
     {
-        ImGui::TableSetupColumn("signal");
-        ImGui::TableSetupColumn("value");
-        ImGui::TableSetupColumn("source");
+        ImGui::TableSetupColumn("model");
+        ImGui::TableSetupColumn("status");
+        ImGui::TableSetupColumn("prompt tok/s");
+        ImGui::TableSetupColumn("decode tok/s");
+        ImGui::TableSetupColumn("prompt eval");
+        ImGui::TableSetupColumn("memory");
         ImGui::TableHeadersRow();
-        const char* rows[][3] = {
-            { "prompt tokens / sec", "42.6", "staged demo" },
-            { "decode tokens / sec", "18.4", "staged demo" },
-            { "time to first token", "0.82 s", "staged demo" },
-            { "memory footprint", "6.1 GB", "staged demo" },
-            { "prompt cache", "not connected", "adapter pending" }
-        };
-        for (const auto& row : rows)
+        for (const LlamaRunResult& result : app.comparison_results)
         {
             ImGui::TableNextRow();
-            for (int column = 0; column < 3; ++column)
-            {
-                ImGui::TableSetColumnIndex(column);
-                ImGui::TextColored(column == 1 ? kInk : kMuted, "%s", row[column]);
-            }
+            ImGui::TableSetColumnIndex(0);
+            ImGui::TextColored(kInk, "%s", result.model.c_str());
+            ImGui::TableSetColumnIndex(1);
+            ImGui::TextColored(result.ok ? kBlueBright : kError, "%s", result.ok ? "measured" : "error");
+            ImGui::TableSetColumnIndex(2);
+            ImGui::TextColored(kInkSoft, "%s", FormatRate(result.prompt_tokens_per_second).c_str());
+            ImGui::TableSetColumnIndex(3);
+            ImGui::TextColored(kInkSoft, "%s", FormatRate(result.decode_tokens_per_second).c_str());
+            ImGui::TableSetColumnIndex(4);
+            ImGui::TextColored(kInkSoft, "%s", FormatSeconds(result.prompt_eval_seconds).c_str());
+            ImGui::TableSetColumnIndex(5);
+            ImGui::TextColored(kInkSoft, "%s", FormatMemory(result.memory_gb).c_str());
         }
         ImGui::EndTable();
+    }
+    for (const LlamaRunResult& result : app.comparison_results)
+    {
+        if (!result.ok && !result.error.empty())
+            ImGui::TextColored(kError, "%s: %s", result.model.c_str(), result.error.c_str());
     }
 }
 
@@ -830,11 +948,11 @@ static void DrawTrace(const AppState& app)
         {
             ImGui::TableNextRow();
             ImGui::TableSetColumnIndex(0);
-            ImGui::TextColored(kInkSoft, "%s", entry.event);
+            ImGui::TextColored(kInkSoft, "%s", entry.event.c_str());
             ImGui::TableSetColumnIndex(1);
-            ImGui::TextColored(kInk, "%s", entry.duration);
+            ImGui::TextColored(kInk, "%s", entry.duration.c_str());
             ImGui::TableSetColumnIndex(2);
-            ImGui::TextColored(app.telemetry_sampled ? kBlueBright : kMuted, "%s", entry.status);
+            ImGui::TextColored(app.telemetry_sampled ? kBlueBright : kMuted, "%s", entry.status.c_str());
         }
         ImGui::EndTable();
     }
@@ -844,12 +962,26 @@ static void DrawSettings(AppState& app)
 {
     ImGui::TextColored(kBlueBright, "SETTINGS");
     ImGui::TextColored(kInk, "Engine controls");
-    ImGui::TextWrapped("These controls are wired to the run command now. The llama.cpp adapter can consume the same values when the backend is connected.");
+    ImGui::TextWrapped("These controls are passed to llama-server for every selected model. Models are run one at a time so the measurements stay comparable.");
     ImGui::Dummy(ImVec2(0.0f, 14.0f));
     ImGui::SliderInt("Threads", &app.threads, 1, 32);
     ImGui::SliderInt("GPU layers", &app.gpu_layers, 0, 64);
     ImGui::SliderInt("Seed", &app.seed, 0, 9999);
-    ImGui::Checkbox("Use prompt cache", &app.use_prompt_cache);
+    ImGui::Dummy(ImVec2(0.0f, 10.0f));
+    ImGui::TextColored(kMuted, "LLAMA-SERVER BINARY");
+    const std::string server_path = app.server_path.empty() ? "Not selected" : WideToUtf8(app.server_path);
+    ImGui::PushFont(g_font_mono);
+    ImGui::TextWrapped("%s", server_path.c_str());
+    ImGui::PopFont();
+    if (QuietButton("Select llama-server.exe", ImVec2(-1.0f, 30.0f)))
+    {
+        std::wstring selected_path;
+        if (ChooseServerFile(selected_path))
+        {
+            app.server_path = selected_path;
+            ShowToast(app, "llama-server.exe selected");
+        }
+    }
     ImGui::Dummy(ImVec2(0.0f, 10.0f));
     ImGui::TextColored(kMuted, "Current command");
     ImGui::PushFont(g_font_mono);
@@ -859,9 +991,13 @@ static void DrawSettings(AppState& app)
 
 static void DrawWorkspace(AppState& app)
 {
-    PanelHeading("ACTIVE SESSION", app.current_model.c_str());
+    const size_t selected_count = SelectedModelCount(app);
+    const std::string selected_label = selected_count == 0
+        ? "No models selected"
+        : std::to_string(selected_count) + (selected_count == 1 ? " model selected" : " models selected");
+    PanelHeading("MODEL COMPARISON", selected_label.c_str());
     ImGui::SameLine(0.0f, 8.0f);
-    ImGui::TextColored(kMuted, "/  %s", app.session_name.c_str());
+    ImGui::TextColored(kMuted, "/  same prompt, sequential runs");
     ImGui::SameLine(std::max(ImGui::GetCursorPosX(), ImGui::GetWindowWidth() - 235.0f));
     if (QuietButton("Copy run command", ImVec2(112.0f, 30.0f)))
     {
@@ -870,9 +1006,9 @@ static void DrawWorkspace(AppState& app)
         ShowToast(app, "Run command copied");
     }
     ImGui::SameLine(0.0f, 6.0f);
-    ImGui::BeginDisabled(app.simulation_busy);
-    if (PrimaryButton("Simulate", ImVec2(94.0f, 30.0f)))
-        StartSimulation(app, {});
+    ImGui::BeginDisabled(app.run_busy);
+    if (PrimaryButton("Run selected", ImVec2(112.0f, 30.0f)))
+        StartRun(app, {});
     ImGui::EndDisabled();
 
     ImGui::Dummy(ImVec2(0.0f, 10.0f));
@@ -910,7 +1046,7 @@ static void DrawTelemetryPlot(const AppState& app)
 {
     ImGui::TextColored(kInkSoft, "Token flow");
     ImGui::SameLine(ImGui::GetWindowWidth() - 92.0f);
-    ImGui::TextColored(kMuted, "%s", app.telemetry_sampled ? "sample only" : "awaiting run");
+    ImGui::TextColored(kMuted, "%s", app.run_busy ? "collecting" : (app.telemetry_sampled ? "llama.cpp" : "awaiting run"));
     ImGui::Dummy(ImVec2(0.0f, 4.0f));
     const ImVec2 plot_size(ImGui::GetContentRegionAvail().x, 102.0f);
     ImGui::InvisibleButton("##TokenPlot", plot_size);
@@ -934,21 +1070,25 @@ static void DrawTelemetry(AppState& app)
 {
     PanelHeading("RUN TELEMETRY", "Signal");
     ImGui::SameLine(ImGui::GetWindowWidth() - 88.0f);
-    ImGui::TextColored(app.telemetry_sampled ? kBlueBright : kMuted, "%s", app.simulation_busy ? "sampling" : (app.telemetry_sampled ? "sampled" : "waiting"));
+    ImGui::TextColored(app.telemetry_sampled ? kBlueBright : kMuted, "%s", app.run_busy ? "sampling" : (app.telemetry_sampled ? "measured" : "waiting"));
     ImGui::Dummy(ImVec2(0.0f, 10.0f));
 
+    const std::string prompt_rate = FormatRate(app.prompt_tokens_per_second);
+    const std::string decode_rate = FormatRate(app.decode_tokens_per_second);
+    const std::string prompt_time = FormatSeconds(app.prompt_eval_seconds);
+    const std::string memory = FormatMemory(app.memory_gb);
     if (ImGui::BeginTable("##MetricGrid", 2, ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_SizingStretchProp))
     {
         ImGui::TableNextRow();
         ImGui::TableSetColumnIndex(0);
-        DrawMetric("Prompt tok/s", app.telemetry_sampled ? "42.6" : "-", app.telemetry_sampled ? "staged demo" : "run pending");
+        DrawMetric("Prompt tok/s", prompt_rate.c_str(), app.telemetry_sampled ? "llama.cpp timing" : "run pending");
         ImGui::TableSetColumnIndex(1);
-        DrawMetric("Decode tok/s", app.telemetry_sampled ? "18.4" : "-", app.telemetry_sampled ? "staged demo" : "run pending");
+        DrawMetric("Decode tok/s", decode_rate.c_str(), app.telemetry_sampled ? "llama.cpp timing" : "run pending");
         ImGui::TableNextRow();
         ImGui::TableSetColumnIndex(0);
-        DrawMetric("First token", app.telemetry_sampled ? "0.82 s" : "-", app.telemetry_sampled ? "staged demo" : "not measured");
+        DrawMetric("Prompt eval", prompt_time.c_str(), app.telemetry_sampled ? "time before decode" : "not measured");
         ImGui::TableSetColumnIndex(1);
-        DrawMetric("Memory", app.telemetry_sampled ? "6.1 GB" : "-", app.telemetry_sampled ? "staged demo" : "adapter pending");
+        DrawMetric("Memory", memory.c_str(), app.telemetry_sampled ? "server working set" : "not measured");
         ImGui::EndTable();
     }
 
@@ -1042,16 +1182,16 @@ static void RunCommandAction(AppState& app, const char* action)
         app.pane = Pane::Diagnostics;
     else if (std::strcmp(action, "trace") == 0)
         app.pane = Pane::Trace;
-    else if (std::strcmp(action, "simulate") == 0)
-        StartSimulation(app, {});
+    else if (std::strcmp(action, "run-selected") == 0)
+        StartRun(app, {});
     else if (std::strcmp(action, "copy") == 0)
     {
         const std::string command = CurrentRunCommand(app);
         ImGui::SetClipboardText(command.c_str());
         ShowToast(app, "Run command copied");
     }
-    else if (std::strcmp(action, "new-session") == 0)
-        StartNewSession(app, true);
+    else if (std::strcmp(action, "clear-playground") == 0)
+        ClearPlayground(app, true);
 }
 
 static void DrawCommandPalette(AppState& app)
@@ -1081,10 +1221,10 @@ static void DrawCommandPalette(AppState& app)
     const Action actions[] = {
         { "Focus prompt", "Jump to the conversation input", "focus" },
         { "Open diagnostics", "Inspect the run surface", "diagnostics" },
-        { "Open trace log", "Inspect the staged event sequence", "trace" },
-        { "Simulate response", "Fill the UI with staged telemetry", "simulate" },
+        { "Open trace log", "Inspect the llama.cpp event sequence", "trace" },
+        { "Run selected models", "Send the prompt through the comparison set", "run-selected" },
         { "Copy run command", "Take the local command with you", "copy" },
-        { "New session", "Clear the current run state", "new-session" }
+        { "Clear playground", "Clear messages and measured results", "clear-playground" }
     };
     const std::string query = LowerCopy(app.command_search);
     for (const Action& action : actions)
@@ -1125,7 +1265,7 @@ static void DrawToast(const AppState& app)
 static void DrawRenaroApp(AppState& app)
 {
     ImGuiIO& io = ImGui::GetIO();
-    AdvanceSimulation(app, io.DeltaTime);
+    AdvanceBackend(app, io.DeltaTime);
 
     if (!io.WantTextInput)
     {
@@ -1216,6 +1356,7 @@ int main(int, char**)
     LoadRenaroLogo();
 
     AppState app;
+    app.server_path = FindLlamaServer().wstring();
     bool done = false;
     while (!done)
     {
@@ -1257,6 +1398,7 @@ int main(int, char**)
         g_SwapChainOccluded = (present_result == DXGI_STATUS_OCCLUDED);
     }
 
+    app.backend.Stop();
     if (g_logo_srv)
     {
         g_logo_srv->Release();
