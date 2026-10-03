@@ -1,0 +1,17 @@
+{
+  "date": "2026-10-03",
+  "framework": "vanilla HTML/CSS/JS",
+  "font_stack": "none found in the existing ImGui repository; prototype uses Google Fonts with local fallbacks",
+  "palette": "none found in the existing ImGui repository",
+  "motion": "no existing motion library",
+  "spacing": "no existing spacing tokens",
+  "preserved": [
+    "D:\\imgui\\renaro\\assets\\logo\\white-transparent.png"
+  ],
+  "introduced": [
+    "Renaro blue terminal model playground",
+    "OKLCH design tokens",
+    "responsive app workbench",
+    "staged interaction states"
+  ]
+}

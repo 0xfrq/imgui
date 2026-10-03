@@ -1,0 +1,385 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <meta name="description" content="Renaro local model playground">
+    <title>Renaro — Playground</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,600;12..96,700;12..96,800&family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="./styles.css">
+    <script defer src="./app.js"></script>
+  </head>
+  <body data-theme="terminal-pulse">
+    <div class="app-root">
+      <aside class="sidebar" aria-label="Renaro navigation">
+        <div class="sidebar__brand">
+          <a class="brand-lockup" href="#playground" aria-label="Renaro Playground">
+            <span class="brand-lockup__mark">
+              <img src="../renaro/assets/logo/white-transparent.png" alt="" width="28" height="28">
+            </span>
+            <span class="brand-lockup__wordmark">RENARO</span>
+          </a>
+          <span class="brand-lockup__product">PLAYGROUND</span>
+        </div>
+
+        <nav class="sidebar-nav" aria-label="Workspace views">
+          <button class="nav-item is-active" type="button" data-pane="chat">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 5.5h14v9H11l-4.5 4v-4H5z"></path><path d="M8 9.5h8M8 12h5"></path></svg>
+            <span>Playground</span>
+            <kbd>1</kbd>
+          </button>
+          <button class="nav-item" type="button" data-pane="diagnostics">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 18.5V13M10 18.5V8M15 18.5v-4M20 18.5V5"></path></svg>
+            <span>Diagnostics</span>
+            <kbd>2</kbd>
+          </button>
+          <button class="nav-item" type="button" data-pane="trace">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6.5h12M6 12h8M6 17.5h5"></path><path d="M17 9v8l3-2.5V11z"></path></svg>
+            <span>Trace log</span>
+            <kbd>3</kbd>
+          </button>
+          <button class="nav-item" type="button" data-pane="settings">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 15.2a3.2 3.2 0 1 0 0-6.4 3.2 3.2 0 0 0 0 6.4Z"></path><path d="m19 13.4 1.2 1-.2 1.2-1.5.8a7.6 7.6 0 0 1-.8 1.4l.2 1.7-1 1-1.7-.2a7.6 7.6 0 0 1-1.4.8l-.8 1.5-1.2.2-1-1.2a7.6 7.6 0 0 1-1.7 0l-1 1.2-1.2-.2-.8-1.5a7.6 7.6 0 0 1-1.4-.8l-1.7.2-1-1 .2-1.7a7.6 7.6 0 0 1-.8-1.4l-1.5-.8-.2-1.2 1.2-1a7.6 7.6 0 0 1 0-1.7l-1.2-1 .2-1.2 1.5-.8a7.6 7.6 0 0 1 .8-1.4L3.7 5l1-1 1.7.2a7.6 7.6 0 0 1 1.4-.8l.8-1.5 1.2-.2 1 1.2a7.6 7.6 0 0 1 1.7 0l1-1.2 1.2.2.8 1.5a7.6 7.6 0 0 1 1.4.8l1.7-.2 1 1-.2 1.7a7.6 7.6 0 0 1 .8 1.4l1.5.8.2 1.2-1.2 1a7.6 7.6 0 0 1 0 1.7Z"></path></svg>
+            <span>Settings</span>
+            <kbd>4</kbd>
+          </button>
+        </nav>
+
+        <div class="sidebar__section sidebar__sessions">
+          <div class="sidebar__section-head">
+            <span>Recent sessions</span>
+            <button class="icon-button icon-button--small" type="button" aria-label="Add session">+</button>
+          </div>
+          <button class="session-item is-active" type="button">
+            <span class="session-item__dot" aria-hidden="true"></span>
+            <span><strong>Untitled study</strong><small>Qwen3 8B · just now</small></span>
+          </button>
+          <button class="session-item" type="button">
+            <span class="session-item__dot" aria-hidden="true"></span>
+            <span><strong>Repetition sweep</strong><small>Llama 3.1 8B · yesterday</small></span>
+          </button>
+          <button class="session-item" type="button">
+            <span class="session-item__dot" aria-hidden="true"></span>
+            <span><strong>Context drift</strong><small>Mistral Nemo · last week</small></span>
+          </button>
+        </div>
+
+        <div class="sidebar__bottom">
+          <div class="engine-status">
+            <span class="status-dot" aria-hidden="true"></span>
+            <span><strong>Local engine</strong><small>adapter not connected</small></span>
+          </div>
+          <span class="sidebar__version">v0.1 playground</span>
+        </div>
+      </aside>
+
+      <div class="app-main" id="playground">
+        <header class="topbar">
+          <div class="topbar__title">
+            <span class="topbar__kicker">LOCAL INFERENCE / WORKSPACE</span>
+            <h1>Playground</h1>
+          </div>
+          <div class="topbar__actions">
+            <span class="run-status"><span class="status-dot" aria-hidden="true"></span><span id="connectionLabel">READY FOR A RUN</span></span>
+            <button class="button button--quiet button--compact" type="button" data-open-command>
+              <span class="command-icon" aria-hidden="true">⌘</span>
+              <span>Find</span>
+              <kbd>K</kbd>
+            </button>
+            <button class="button button--primary button--compact" type="button" id="newSession">New session</button>
+          </div>
+        </header>
+
+        <main class="app-layout">
+          <aside class="model-shelf" aria-label="Model library">
+            <div class="panel-heading">
+              <div>
+                <span class="panel-label">Models</span>
+                <h2>Library</h2>
+              </div>
+              <button class="icon-button" type="button" aria-label="Model library options">···</button>
+            </div>
+
+            <div class="model-list">
+              <button class="model-card is-active" type="button" aria-pressed="true" data-model="Qwen3 8B">
+                <span class="model-card__symbol">Q</span>
+                <span class="model-card__copy">
+                  <strong>Qwen3 8B</strong>
+                  <small>8.2B · GGUF · ready</small>
+                </span>
+                <span class="model-card__state">active</span>
+              </button>
+              <button class="model-card" type="button" aria-pressed="false" data-model="Llama 3.1 8B">
+                <span class="model-card__symbol">L</span>
+                <span class="model-card__copy">
+                  <strong>Llama 3.1 8B</strong>
+                  <small>8.0B · GGUF · staged</small>
+                </span>
+                <span class="model-card__state">staged</span>
+              </button>
+              <button class="model-card" type="button" aria-pressed="false" data-model="Mistral Nemo">
+                <span class="model-card__symbol">M</span>
+                <span class="model-card__copy">
+                  <strong>Mistral Nemo</strong>
+                  <small>12.2B · GGUF · staged</small>
+                </span>
+                <span class="model-card__state">staged</span>
+              </button>
+              <button class="model-card" type="button" aria-pressed="false" data-model="Gemma 3 12B">
+                <span class="model-card__symbol">G</span>
+                <span class="model-card__copy">
+                  <strong>Gemma 3 12B</strong>
+                  <small>12.2B · GGUF · staged</small>
+                </span>
+                <span class="model-card__state">staged</span>
+              </button>
+            </div>
+
+            <label class="load-model" for="modelFile">
+              <input id="modelFile" type="file" accept=".gguf,.bin,.safetensors">
+              <span class="load-model__plus" aria-hidden="true">+</span>
+              <span>
+                <strong id="loadModelLabel">Import local model</strong>
+                <small id="loadModelMeta">GGUF / safetensors</small>
+              </span>
+            </label>
+
+            <div class="shelf-footnote">
+              <span>Model directory</span>
+              <strong>—</strong>
+              <small>Choose a directory when the engine adapter is connected.</small>
+            </div>
+          </aside>
+
+          <section class="workspace" aria-label="Model playground">
+            <header class="workspace-header">
+              <div>
+                <span class="panel-label">Active session</span>
+                <h2 id="workspaceTitle">Qwen3 8B <span>/</span> Untitled study</h2>
+              </div>
+              <div class="workspace-header__actions">
+                <button class="button button--secondary button--compact" type="button" data-copy-command>
+                  <span class="button__label">Copy run command</span>
+                </button>
+                <button class="button button--primary button--compact" type="button" id="simulateRun">
+                  <span class="button__label">Simulate response</span>
+                  <span aria-hidden="true">↗</span>
+                </button>
+              </div>
+            </header>
+
+            <div class="workspace-tabs" role="tablist" aria-label="Session views">
+              <button class="workspace-tab is-active" type="button" role="tab" aria-selected="true" data-pane="chat">Conversation</button>
+              <button class="workspace-tab" type="button" role="tab" aria-selected="false" data-pane="diagnostics">Diagnostics</button>
+              <button class="workspace-tab" type="button" role="tab" aria-selected="false" data-pane="trace">Trace</button>
+            </div>
+
+            <div class="workspace-body">
+              <div class="conversation-pane" data-pane-view="chat">
+                <div class="conversation-scroll" id="conversationScroll" aria-live="polite">
+                  <article class="message message--system">
+                    <div class="message__meta">
+                      <span class="message__role">System</span>
+                      <time>ready</time>
+                    </div>
+                    <p>You are a local research assistant. State assumptions, show uncertainty, and keep the answer close to the evidence.</p>
+                  </article>
+
+                  <article class="message message--user">
+                    <div class="message__meta">
+                      <span class="message__role">You</span>
+                      <time>09:41</time>
+                    </div>
+                    <p>Give me three hypotheses for why this prompt might increase repetition.</p>
+                  </article>
+
+                  <article class="message message--assistant">
+                    <div class="message__meta">
+                      <span class="message__role">Qwen3 8B</span>
+                      <time>09:41</time>
+                    </div>
+                    <p>Start with the context window, sampling temperature, and the stop sequence. Hold the model constant, change one variable at a time, and record the decode trace.</p>
+                    <div class="message__annotation">
+                      <span class="annotation-line" aria-hidden="true"></span>
+                      sample stream · llama.cpp adapter pending
+                    </div>
+                  </article>
+                </div>
+
+                <form class="prompt-form" id="promptForm" novalidate>
+                  <label class="sr-only" for="promptInput">Prompt</label>
+                  <textarea id="promptInput" rows="1" placeholder="Ask the loaded model…" aria-describedby="promptHelp"></textarea>
+                  <div class="prompt-form__footer">
+                    <span id="promptHelp">Enter sends · Shift+Enter adds a line</span>
+                    <button class="button button--primary send-button" type="submit">
+                      <span class="button__label">Send prompt</span>
+                      <span aria-hidden="true">↗</span>
+                    </button>
+                  </div>
+                </form>
+              </div>
+
+              <div class="diagnostics-pane" data-pane-view="diagnostics" hidden>
+                <div class="pane-empty">
+                  <span class="pane-empty__mark" aria-hidden="true">Δ</span>
+                  <h3>Diagnostics begin with the first real run.</h3>
+                  <p>Tokenization, sampling, prompt-cache hits, and memory pressure will live here.</p>
+                  <button class="button button--secondary button--compact" type="button" data-switch-pane="chat">Return to conversation</button>
+                </div>
+              </div>
+
+              <div class="trace-pane" data-pane-view="trace" hidden>
+                <div class="trace-list">
+                  <div class="trace-row trace-row--heading">
+                    <span>event</span><span>duration</span><span>status</span>
+                  </div>
+                  <div class="trace-row"><span>load context</span><strong>—</strong><span class="trace-status">pending</span></div>
+                  <div class="trace-row"><span>prefill</span><strong>—</strong><span class="trace-status">pending</span></div>
+                  <div class="trace-row"><span>decode loop</span><strong>—</strong><span class="trace-status">pending</span></div>
+                  <div class="trace-row"><span>stream tokens</span><strong>—</strong><span class="trace-status">pending</span></div>
+                </div>
+              </div>
+
+              <div class="settings-pane" data-pane-view="settings" hidden>
+                <div class="pane-empty">
+                  <span class="pane-empty__mark" aria-hidden="true">/</span>
+                  <h3>Keep the engine settings close.</h3>
+                  <p>Threads, GPU layers, context size, and sampler presets will become configurable here.</p>
+                  <button class="button button--secondary button--compact" type="button" data-switch-pane="chat">Return to conversation</button>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <aside class="telemetry-panel" aria-label="Inference telemetry">
+            <div class="panel-heading panel-heading--telemetry">
+              <div>
+                <span class="panel-label">Run telemetry</span>
+                <h2>Signal</h2>
+              </div>
+              <span class="telemetry-state" id="telemetryState">waiting</span>
+            </div>
+
+            <div class="metric-list">
+              <div class="metric-card">
+                <span>Prompt tok/s</span>
+                <strong id="promptSpeed">—</strong>
+                <small id="promptSpeedNote">run pending</small>
+              </div>
+              <div class="metric-card">
+                <span>Decode tok/s</span>
+                <strong id="decodeSpeed">—</strong>
+                <small id="decodeSpeedNote">run pending</small>
+              </div>
+              <div class="metric-card">
+                <span>Time to first token</span>
+                <strong id="firstToken">—</strong>
+                <small id="firstTokenNote">not measured</small>
+              </div>
+              <div class="metric-card">
+                <span>Memory footprint</span>
+                <strong id="memoryFootprint">—</strong>
+                <small id="memoryNote">adapter not connected</small>
+              </div>
+            </div>
+
+            <div class="telemetry-plot" aria-label="Illustrative token flow">
+              <div class="plot-heading">
+                <span>Token flow</span>
+                <small id="plotNote">awaiting run</small>
+              </div>
+              <div class="plot-bars" aria-hidden="true">
+                <span style="--bar-scale: .26"></span>
+                <span style="--bar-scale: .42"></span>
+                <span style="--bar-scale: .34"></span>
+                <span style="--bar-scale: .58"></span>
+                <span style="--bar-scale: .49"></span>
+                <span style="--bar-scale: .72"></span>
+                <span style="--bar-scale: .62"></span>
+                <span style="--bar-scale: .84"></span>
+                <span style="--bar-scale: .74"></span>
+                <span style="--bar-scale: .94"></span>
+                <span style="--bar-scale: .79"></span>
+                <span style="--bar-scale: .68"></span>
+              </div>
+            </div>
+
+            <div class="run-controls">
+              <div class="control-heading">
+                <label for="temperature">Temperature</label>
+                <output id="temperatureValue" for="temperature">0.70</output>
+              </div>
+              <input id="temperature" type="range" min="0" max="1.5" step="0.05" value="0.7">
+
+              <label class="select-label" for="contextLength">Context window</label>
+              <select id="contextLength">
+                <option>4,096 tokens</option>
+                <option selected>8,192 tokens</option>
+                <option>16,384 tokens</option>
+                <option>32,768 tokens</option>
+              </select>
+            </div>
+
+            <div class="command-card">
+              <div class="command-card__head">
+                <span>Run command</span>
+                <span class="command-card__status">local</span>
+              </div>
+              <code id="runCommand">renaro run --model qwen3-8b --ctx 8192</code>
+              <button class="button button--text button--compact" type="button" data-copy-command>
+                <span class="button__label">Copy command</span>
+                <span aria-hidden="true">↗</span>
+              </button>
+            </div>
+          </aside>
+        </main>
+      </div>
+    </div>
+
+    <dialog class="command-dialog" id="commandDialog" aria-labelledby="commandDialogTitle">
+      <div class="command-dialog__head">
+        <div>
+          <span class="panel-label">Renaro command palette</span>
+          <h2 id="commandDialogTitle">Find an action</h2>
+        </div>
+        <button class="icon-button" type="button" data-close-command aria-label="Close command palette">×</button>
+      </div>
+      <label class="command-search">
+        <span aria-hidden="true">⌕</span>
+        <input id="commandSearch" type="search" placeholder="Search actions…" autocomplete="off">
+        <kbd>Esc</kbd>
+      </label>
+      <div class="command-results" id="commandResults">
+        <button class="command-item" type="button" data-command="focus-prompt">
+          <span><strong>Focus prompt</strong><small>Jump to the conversation input</small></span>
+          <kbd>↵</kbd>
+        </button>
+        <button class="command-item" type="button" data-command="open-diagnostics">
+          <span><strong>Open diagnostics</strong><small>Inspect the run surface</small></span>
+          <kbd>↵</kbd>
+        </button>
+        <button class="command-item" type="button" data-command="simulate">
+          <span><strong>Simulate response</strong><small>Fill the UI with staged telemetry</small></span>
+          <kbd>↵</kbd>
+        </button>
+        <button class="command-item" type="button" data-command="copy-command">
+          <span><strong>Copy run command</strong><small>Take the local command with you</small></span>
+          <kbd>↵</kbd>
+        </button>
+        <button class="command-item" type="button" data-command="new-session">
+          <span><strong>New session</strong><small>Clear the current run state</small></span>
+          <kbd>↵</kbd>
+        </button>
+      </div>
+      <div class="command-dialog__foot">
+        <span><kbd>↑</kbd><kbd>↓</kbd> navigate</span>
+        <span><kbd>↵</kbd> select</span>
+        <span><kbd>Esc</kbd> close</span>
+      </div>
+    </dialog>
+
+    <div class="toast" id="toast" role="status" aria-live="polite"></div>
+  </body>
+</html>

@@ -1,0 +1,9 @@
+[
+  {
+    "date": "2026-10-03",
+    "macrostructure": "Workbench",
+    "theme": "Renaro blue terminal model playground",
+    "enrichment": "none",
+    "brief": "A vanilla HTML/CSS/JS playground for local model chat, telemetry, and traces"
+  }
+]

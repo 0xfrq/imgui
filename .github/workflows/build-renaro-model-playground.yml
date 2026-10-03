@@ -1,0 +1,57 @@
+name: Build Renaro Model Playground
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "examples/example_renaro_model_playground/**"
+      - "renaro/assets/logo/**"
+      - "backends/**"
+      - "imgui*.cpp"
+      - "imgui*.h"
+      - ".github/workflows/build-renaro-model-playground.yml"
+
+jobs:
+  build:
+    name: Build Renaro DirectX11 playground
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Set up MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Build executable
+        shell: cmd
+        run: |
+          if not exist build\renaro_model_playground mkdir build\renaro_model_playground
+          cl.exe /nologo /EHsc /std:c++17 /MD /utf-8 ^
+            /I. /Ibackends ^
+            examples\example_renaro_model_playground\main.cpp ^
+            backends\imgui_impl_dx11.cpp ^
+            backends\imgui_impl_win32.cpp ^
+            imgui.cpp ^
+            imgui_demo.cpp ^
+            imgui_draw.cpp ^
+            imgui_tables.cpp ^
+            imgui_widgets.cpp ^
+            /Fe:build\renaro_model_playground\renaro_model_playground.exe ^
+            /Fo:build\renaro_model_playground\ ^
+            /link d3d11.lib d3dcompiler.lib dxgi.lib windowscodecs.lib comdlg32.lib ole32.lib gdi32.lib dwmapi.lib
+
+      - name: Package Renaro logo
+        shell: cmd
+        run: |
+          if not exist build\renaro_model_playground\renaro\assets\logo mkdir build\renaro_model_playground\renaro\assets\logo
+          copy /Y renaro\assets\logo\white-transparent.png build\renaro_model_playground\renaro\assets\logo\white-transparent.png
+
+      - name: Upload playground artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: renaro-model-playground-windows
+          path: build/renaro_model_playground
+          if-no-files-found: error
