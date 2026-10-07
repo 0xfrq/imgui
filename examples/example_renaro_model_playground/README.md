@@ -13,6 +13,15 @@ Renaro Model Playground is a native Dear ImGui workbench for testing local open-
 - Exposes context, temperature, max output tokens, prompt-cache reuse, threads, batch threads, GPU layers, batch and micro-batch sizes, flash attention, memory mapping, memory locking, KV offload, and seed controls.
 - Lets the user select `llama-server.exe` from Settings and copy the equivalent launch command.
 
+## Interface
+
+- A navigation rail (Playground, Diagnostics, Trace log, Settings) with an engine status card showing whether `llama-server.exe` was found.
+- The Playground has three columns: the model library (file size, parameter count and quantization read from the GGUF file name), the conversation, and a live insights column with throughput tiles, a per-model decode-speed chart, llama.cpp signals and quick controls.
+- Responses render as model-coloured cards with copy buttons, collapsible reasoning and code blocks with their own copy action.
+- Diagnostics shows a card per model (the fastest decode is highlighted), a side-by-side table and the latest response grouped by identity, timing, tokens, server and resources. The trace log can be filtered and copied as tab-separated text.
+- Shortcuts: `Ctrl+K` opens the command palette, `1`-`4` switch views, `Enter` runs the prompt, `Shift+Enter` adds a line.
+- Icons come from the Segoe MDL2 Assets / Segoe Fluent Icons fonts that ship with Windows; if neither is present the UI falls back to text labels.
+
 Models run sequentially so a later model does not compete with an earlier model for RAM or VRAM. This produces more useful performance comparisons on typical research workstations.
 
 The model library starts empty by design. No model names or placeholder entries are bundled into the playground.
