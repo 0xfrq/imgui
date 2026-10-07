@@ -20,6 +20,12 @@ struct LlamaModelJob
     std::wstring path;
 };
 
+struct LlamaChatMessage
+{
+    std::string role;
+    std::string content;
+};
+
 struct LlamaRunConfig
 {
     std::wstring server_path;
@@ -38,6 +44,20 @@ struct LlamaRunConfig
     bool mmap = true;
     bool mlock = false;
     bool kv_offload = true;
+
+    // Optional sampling parameters; values <= 0 leave the server default in place.
+    float top_p = 0.0f;
+    int top_k = 0;
+    float repeat_penalty = 0.0f;
+
+    // Optional conversation framing. When set, the request is
+    // [system] + history + [user: prompt] instead of a single user message.
+    std::string system_prompt;
+    std::vector<LlamaChatMessage> history;
+
+    // Keep llama-server running after the request so the next run with the same model and
+    // launch settings skips the load. The server is stopped by Stop() or a non-matching run.
+    bool keep_server_alive = false;
 };
 
 struct LlamaRunResult
@@ -149,6 +169,7 @@ private:
     void PushResult(LlamaRunResult result);
     void TerminateServer();
     mutable std::mutex process_mutex_;
+    std::wstring loaded_signature_;
 
     mutable std::mutex mutex_;
     std::thread worker_;

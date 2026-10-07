@@ -352,6 +352,40 @@ static ProcessSnapshot ReadProcessSnapshot(HANDLE process)
     return snapshot;
 }
 
+static std::wstring BuildServerCommand(const LlamaModelJob& model, const LlamaRunConfig& config)
+{
+    std::wstring command = QuoteArg(config.server_path);
+    command += L" -m " + QuoteArg(model.path);
+    command += L" -c " + std::to_wstring(config.context);
+    command += L" --host 127.0.0.1 --port " + std::to_wstring(config.port);
+    command += L" -t " + std::to_wstring(config.threads);
+    command += L" -tb " + std::to_wstring(config.threads_batch);
+    command += L" -ngl " + std::to_wstring(config.gpu_layers);
+    command += L" -b " + std::to_wstring(config.batch_size);
+    command += L" -ub " + std::to_wstring(config.ubatch_size);
+    command += L" --seed " + std::to_wstring(config.seed);
+    command += L" --temp " + std::to_wstring(config.temperature);
+    if (config.flash_attention)
+        command += L" --flash-attn on";
+    if (!config.mmap)
+        command += L" --no-mmap";
+    if (config.mlock)
+        command += L" --mlock";
+    if (!config.kv_offload)
+        command += L" --no-kv-offload";
+    return command;
+}
+
+// Launch settings that decide whether an already running server can be reused.
+// Temperature and seed are sent per request, so they are left out.
+static std::wstring ServerSignature(const LlamaModelJob& model, const LlamaRunConfig& config)
+{
+    LlamaRunConfig launch = config;
+    launch.temperature = 0.0f;
+    launch.seed = 0;
+    return BuildServerCommand(model, launch);
+}
+
 static double ReadProcessCpuSeconds(HANDLE process)
 {
     if (!process)
@@ -470,7 +504,8 @@ void LlamaServerBackend::RunComparison(std::vector<LlamaModelJob> models, std::s
         RunModel(models[index], prompt, config, result);
         PushResult(std::move(result));
     }
-    StopServer();
+    if (!config.keep_server_alive || IsStopRequested())
+        StopServer();
     std::lock_guard<std::mutex> lock(mutex_);
     busy_ = false;
     status_ = "ready";
@@ -498,25 +533,45 @@ bool LlamaServerBackend::RunModel(const LlamaModelJob& model, const std::string&
         return false;
     }
 
-    SetStatus("loading " + model.name);
     std::string error;
     const auto server_started = std::chrono::steady_clock::now();
-    if (!StartServer(model, config, error))
+    const std::wstring signature = ServerSignature(model, config);
+    bool reuse_server = false;
+    if (config.keep_server_alive)
     {
-        if (IsStopRequested())
-            mark_cancelled();
-        else
-            result.error = error;
-        return false;
+        std::lock_guard<std::mutex> lock(process_mutex_);
+        reuse_server = process_.hProcess && loaded_signature_ == signature && ::WaitForSingleObject(process_.hProcess, 0) == WAIT_TIMEOUT;
     }
-    if (!WaitForHealth(config, error))
+    if (reuse_server)
     {
-        if (IsStopRequested())
-            mark_cancelled();
-        else
-            result.error = error;
+        SetStatus("reusing loaded " + model.name);
+    }
+    else
+    {
+        // A server kept alive for a different model or launch setting must go first.
         StopServer();
-        return false;
+        SetStatus("loading " + model.name);
+        if (!StartServer(model, config, error))
+        {
+            if (IsStopRequested())
+                mark_cancelled();
+            else
+                result.error = error;
+            return false;
+        }
+        {
+            std::lock_guard<std::mutex> lock(process_mutex_);
+            loaded_signature_ = signature;
+        }
+        if (!WaitForHealth(config, error))
+        {
+            if (IsStopRequested())
+                mark_cancelled();
+            else
+                result.error = error;
+            StopServer();
+            return false;
+        }
     }
     if (IsStopRequested())
     {
@@ -524,15 +579,34 @@ bool LlamaServerBackend::RunModel(const LlamaModelJob& model, const std::string&
         StopServer();
         return false;
     }
-    result.server_load_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - server_started).count();
+    result.server_load_seconds = reuse_server ? 0.0 : std::chrono::duration<double>(std::chrono::steady_clock::now() - server_started).count();
 
     SetStatus("streaming " + model.name);
     std::ostringstream body;
-    body << "{\"model\":\"local\",\"messages\":[{\"role\":\"user\",\"content\":\"" << JsonEscape(prompt)
-         << "\"}],\"temperature\":" << std::fixed << std::setprecision(3) << config.temperature
+    body << "{\"model\":\"local\",\"messages\":[";
+    bool first_message = true;
+    const auto append_message = [&](const std::string& role, const std::string& content)
+    {
+        if (!first_message)
+            body << ',';
+        first_message = false;
+        body << "{\"role\":\"" << JsonEscape(role) << "\",\"content\":\"" << JsonEscape(content) << "\"}";
+    };
+    if (!config.system_prompt.empty())
+        append_message("system", config.system_prompt);
+    for (const LlamaChatMessage& message : config.history)
+        append_message(message.role, message.content);
+    append_message("user", prompt);
+    body << "],\"temperature\":" << std::fixed << std::setprecision(3) << config.temperature
          << ",\"max_tokens\":" << config.max_tokens << ",\"seed\":" << config.seed
-         << ",\"cache_prompt\":" << (config.cache_prompt ? "true" : "false")
-         << ",\"stream\":true}";
+         << ",\"cache_prompt\":" << (config.cache_prompt ? "true" : "false");
+    if (config.top_p > 0.0f)
+        body << ",\"top_p\":" << config.top_p;
+    if (config.top_k > 0)
+        body << ",\"top_k\":" << config.top_k;
+    if (config.repeat_penalty > 0.0f)
+        body << ",\"repeat_penalty\":" << config.repeat_penalty;
+    body << ",\"stream\":true}";
     std::string response;
     DWORD status_code = 0;
     std::string stream_buffer;
@@ -908,7 +982,8 @@ bool LlamaServerBackend::RunModel(const LlamaModelJob& model, const std::string&
     if (result.response_model.empty())
         result.response_model = "local";
     result.ok = true;
-    StopServer();
+    if (!config.keep_server_alive)
+        StopServer();
     return true;
 }
 
@@ -921,25 +996,7 @@ bool LlamaServerBackend::StartServer(const LlamaModelJob& model, const LlamaRunC
         return false;
     }
 
-    std::wstring command = QuoteArg(config.server_path);
-    command += L" -m " + QuoteArg(model.path);
-    command += L" -c " + std::to_wstring(config.context);
-    command += L" --host 127.0.0.1 --port " + std::to_wstring(config.port);
-    command += L" -t " + std::to_wstring(config.threads);
-    command += L" -tb " + std::to_wstring(config.threads_batch);
-    command += L" -ngl " + std::to_wstring(config.gpu_layers);
-    command += L" -b " + std::to_wstring(config.batch_size);
-    command += L" -ub " + std::to_wstring(config.ubatch_size);
-    command += L" --seed " + std::to_wstring(config.seed);
-    command += L" --temp " + std::to_wstring(config.temperature);
-    if (config.flash_attention)
-        command += L" --flash-attn on";
-    if (!config.mmap)
-        command += L" --no-mmap";
-    if (config.mlock)
-        command += L" --mlock";
-    if (!config.kv_offload)
-        command += L" --no-kv-offload";
+    const std::wstring command = BuildServerCommand(model, config);
 
     STARTUPINFOW startup = {};
     startup.cb = sizeof(startup);
@@ -967,6 +1024,7 @@ void LlamaServerBackend::StopServer()
         std::lock_guard<std::mutex> lock(process_mutex_);
         process = process_;
         process_ = {};
+        loaded_signature_.clear();
     }
     if (process.hProcess)
     {
