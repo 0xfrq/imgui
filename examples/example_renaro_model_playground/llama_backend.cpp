@@ -17,18 +17,36 @@
 
 namespace
 {
+// Quotes one argument for CommandLineToArgvW: backslashes are only doubled when they
+// precede a quote or the closing quote.
 static std::wstring QuoteArg(const std::wstring& value)
 {
     std::wstring result = L"\"";
+    size_t backslashes = 0;
     for (wchar_t character : value)
     {
+        if (character == L'\\')
+        {
+            ++backslashes;
+            continue;
+        }
         if (character == L'\"')
-            result += L"\\\"";
+            result.append(backslashes * 2 + 1, L'\\');
         else
-            result += character;
+            result.append(backslashes, L'\\');
+        backslashes = 0;
+        result += character;
     }
+    result.append(backslashes * 2, L'\\');
     result += L"\"";
     return result;
+}
+
+static std::wstring QuoteArgIfNeeded(const std::wstring& value)
+{
+    if (!value.empty() && value.find_first_of(L" \t\n\v\"") == std::wstring::npos)
+        return value;
+    return QuoteArg(value);
 }
 
 static std::string JsonEscape(const std::string& value)
@@ -46,9 +64,16 @@ static std::string JsonEscape(const std::string& value)
         case '\t': result += "\\t"; break;
         default:
             if (character < 0x20)
-                result += ' ';
+            {
+                static const char* const kHex = "0123456789abcdef";
+                result += "\\u00";
+                result += kHex[character >> 4];
+                result += kHex[character & 0x0f];
+            }
             else
+            {
                 result += static_cast<char>(character);
+            }
             break;
         }
     }
@@ -141,6 +166,24 @@ static bool ExtractJsonString(const std::string& json, const char* key, std::str
             if (!ParseHex4(json, cursor, codepoint))
                 return false;
             cursor += 4;
+            // Characters outside the BMP arrive as a UTF-16 surrogate pair (😀).
+            if (codepoint >= 0xd800 && codepoint <= 0xdbff)
+            {
+                unsigned int low = 0;
+                if (cursor + 6 <= json.size() && json[cursor] == '\\' && json[cursor + 1] == 'u' && ParseHex4(json, cursor + 2, low) && low >= 0xdc00 && low <= 0xdfff)
+                {
+                    codepoint = 0x10000 + ((codepoint - 0xd800) << 10) + (low - 0xdc00);
+                    cursor += 6;
+                }
+                else
+                {
+                    codepoint = 0xfffd;
+                }
+            }
+            else if (codepoint >= 0xdc00 && codepoint <= 0xdfff)
+            {
+                codepoint = 0xfffd;
+            }
             AppendUtf8(value, codepoint);
             break;
         }
@@ -336,6 +379,7 @@ struct ProcessSnapshot
     double working_gb = 0.0;
     double peak_working_gb = 0.0;
     double private_gb = 0.0;
+    double peak_private_gb = 0.0;
 };
 
 static ProcessSnapshot ReadProcessSnapshot(HANDLE process)
@@ -349,6 +393,7 @@ static ProcessSnapshot ReadProcessSnapshot(HANDLE process)
     snapshot.working_gb = static_cast<double>(counters.WorkingSetSize) / (1024.0 * 1024.0 * 1024.0);
     snapshot.peak_working_gb = static_cast<double>(counters.PeakWorkingSetSize) / (1024.0 * 1024.0 * 1024.0);
     snapshot.private_gb = static_cast<double>(counters.PrivateUsage) / (1024.0 * 1024.0 * 1024.0);
+    snapshot.peak_private_gb = static_cast<double>(counters.PeakPagefileUsage) / (1024.0 * 1024.0 * 1024.0);
     return snapshot;
 }
 
@@ -373,6 +418,13 @@ static std::wstring BuildServerCommand(const LlamaModelJob& model, const LlamaRu
         command += L" --mlock";
     if (!config.kv_offload)
         command += L" --no-kv-offload";
+    if (config.parallel > 0)
+        command += L" -np " + std::to_wstring(config.parallel);
+    // chat_template_kwargs (enable_thinking) is only honoured by the Jinja chat template engine.
+    if (config.enable_thinking >= 0)
+        command += L" --jinja";
+    for (const std::wstring& argument : config.extra_server_args)
+        command += L" " + QuoteArgIfNeeded(argument);
     return command;
 }
 
@@ -406,9 +458,28 @@ static double ReadProcessCpuSeconds(HANDLE process)
 }
 }
 
+std::wstring LlamaServerCommandLine(const LlamaModelJob& model, const LlamaRunConfig& config)
+{
+    return BuildServerCommand(model, config);
+}
+
+bool LlamaServerAnswers(int port, bool require_healthy)
+{
+    std::string response;
+    DWORD status_code = 0;
+    std::string error;
+    const bool healthy = HttpRequest(port, L"GET", L"/health", {}, response, status_code, error);
+    return require_healthy ? healthy : status_code != 0;
+}
+
 LlamaServerBackend::~LlamaServerBackend()
 {
     Stop();
+    if (job_)
+    {
+        ::CloseHandle(job_);
+        job_ = nullptr;
+    }
 }
 
 bool LlamaServerBackend::StartComparison(const std::vector<LlamaModelJob>& models, const std::string& prompt, const LlamaRunConfig& config, std::string& error)
@@ -419,7 +490,7 @@ bool LlamaServerBackend::StartComparison(const std::vector<LlamaModelJob>& model
         error = "Select at least one model first";
         return false;
     }
-    if (config.server_path.empty())
+    if (config.server_path.empty() && !config.attach_existing)
     {
         error = "Select llama-server.exe in Settings first";
         return false;
@@ -527,7 +598,7 @@ bool LlamaServerBackend::RunModel(const LlamaModelJob& model, const std::string&
         mark_cancelled();
         return false;
     }
-    if (model.path.empty())
+    if (model.path.empty() && !config.attach_existing)
     {
         result.error = "No local model file is attached to this entry";
         return false;
@@ -537,12 +608,25 @@ bool LlamaServerBackend::RunModel(const LlamaModelJob& model, const std::string&
     const auto server_started = std::chrono::steady_clock::now();
     const std::wstring signature = ServerSignature(model, config);
     bool reuse_server = false;
-    if (config.keep_server_alive)
+    if (config.keep_server_alive && !config.attach_existing)
     {
         std::lock_guard<std::mutex> lock(process_mutex_);
         reuse_server = process_.hProcess && loaded_signature_ == signature && ::WaitForSingleObject(process_.hProcess, 0) == WAIT_TIMEOUT;
     }
-    if (reuse_server)
+    if (config.attach_existing)
+    {
+        // The server was started outside this process; only check that it answers.
+        SetStatus("connecting to llama-server on port " + std::to_string(config.port));
+        if (!WaitForHealth(config, error))
+        {
+            if (IsStopRequested())
+                mark_cancelled();
+            else
+                result.error = error;
+            return false;
+        }
+    }
+    else if (reuse_server)
     {
         SetStatus("reusing loaded " + model.name);
     }
@@ -579,7 +663,7 @@ bool LlamaServerBackend::RunModel(const LlamaModelJob& model, const std::string&
         StopServer();
         return false;
     }
-    result.server_load_seconds = reuse_server ? 0.0 : std::chrono::duration<double>(std::chrono::steady_clock::now() - server_started).count();
+    result.server_load_seconds = (reuse_server || config.attach_existing) ? 0.0 : std::chrono::duration<double>(std::chrono::steady_clock::now() - server_started).count();
 
     SetStatus("streaming " + model.name);
     std::ostringstream body;
@@ -597,15 +681,23 @@ bool LlamaServerBackend::RunModel(const LlamaModelJob& model, const std::string&
     for (const LlamaChatMessage& message : config.history)
         append_message(message.role, message.content);
     append_message("user", prompt);
-    body << "],\"temperature\":" << std::fixed << std::setprecision(3) << config.temperature
+    body << "],\"temperature\":" << std::fixed << std::setprecision(6) << config.temperature
          << ",\"max_tokens\":" << config.max_tokens << ",\"seed\":" << config.seed
          << ",\"cache_prompt\":" << (config.cache_prompt ? "true" : "false");
-    if (config.top_p > 0.0f)
+    if (config.explicit_sampling || config.top_p > 0.0f)
         body << ",\"top_p\":" << config.top_p;
-    if (config.top_k > 0)
+    if (config.explicit_sampling || config.top_k > 0)
         body << ",\"top_k\":" << config.top_k;
-    if (config.repeat_penalty > 0.0f)
+    if (config.explicit_sampling || config.min_p >= 0.0f)
+        body << ",\"min_p\":" << std::max(0.0f, config.min_p);
+    if (config.explicit_sampling || config.repeat_penalty > 0.0f)
         body << ",\"repeat_penalty\":" << config.repeat_penalty;
+    if (config.explicit_sampling || config.presence_penalty != 0.0f)
+        body << ",\"presence_penalty\":" << config.presence_penalty;
+    if (config.explicit_sampling || config.frequency_penalty != 0.0f)
+        body << ",\"frequency_penalty\":" << config.frequency_penalty;
+    if (config.enable_thinking >= 0)
+        body << ",\"chat_template_kwargs\":{\"enable_thinking\":" << (config.enable_thinking > 0 ? "true" : "false") << "}";
     body << ",\"stream\":true}";
     std::string response;
     DWORD status_code = 0;
@@ -713,20 +805,27 @@ bool LlamaServerBackend::RunModel(const LlamaModelJob& model, const std::string&
         has_content = ExtractJsonString(response, "\"content\"", result.text);
         ExtractJsonString(response, "\"reasoning_content\"", result.reasoning);
     }
+    result.content = has_content ? result.text : std::string();
+    ExtractJsonStringLast(response, "\"finish_reason\"", result.finish_reason);
     if (!has_content && result.reasoning.empty())
     {
-        ExtractJsonString(response, "\"error\"", result.error);
-        if (result.error.empty())
-            result.error = "llama-server returned no assistant content";
-        StopServer();
-        return false;
+        // llama.cpp reports errors as {"error":"..."} or {"error":{"message":"..."}}.
+        const bool server_error = response.find("\"error\"") != std::string::npos;
+        if (!config.allow_empty_content || server_error)
+        {
+            if (!ExtractJsonString(response, "\"error\"", result.error) && server_error)
+                ExtractJsonString(response, "\"message\"", result.error);
+            if (result.error.empty())
+                result.error = "llama-server returned no assistant content";
+            StopServer();
+            return false;
+        }
     }
     if (!has_content)
         result.text = result.reasoning;
     ExtractJsonString(response, "\"id\"", result.response_id);
     ExtractJsonString(response, "\"object\"", result.response_object);
     ExtractJsonString(response, "\"system_fingerprint\"", result.system_fingerprint);
-    ExtractJsonStringLast(response, "\"finish_reason\"", result.finish_reason);
     ExtractJsonString(response, "\"model\"", result.response_model);
 
     if (IsStopRequested())
@@ -797,6 +896,8 @@ bool LlamaServerBackend::RunModel(const LlamaModelJob& model, const std::string&
             result.threads_batch = static_cast<int>(value);
         if (ExtractJsonNumber(props_response, "\"n_gpu_layers\"", value))
             result.gpu_layers = static_cast<int>(value);
+        if (ExtractJsonNumber(props_response, "\"total_slots\"", value))
+            result.total_slots = static_cast<int>(value);
     }
 
     // /slots is optional across llama.cpp builds, so enrich the run when available.
@@ -971,6 +1072,7 @@ bool LlamaServerBackend::RunModel(const LlamaModelJob& model, const std::string&
     result.memory_gb = memory.working_gb;
     result.peak_memory_gb = memory.peak_working_gb;
     result.private_memory_gb = memory.private_gb;
+    result.peak_private_memory_gb = memory.peak_private_gb;
     if (prompt_ms > 0.0 || predicted_ms > 0.0 || prompt_per_second > 0.0 || decode_per_second > 0.0)
         result.timings_source = "llama.cpp timings";
     else if (predicted_tokens > 0.0)
@@ -998,16 +1100,31 @@ bool LlamaServerBackend::StartServer(const LlamaModelJob& model, const LlamaRunC
 
     const std::wstring command = BuildServerCommand(model, config);
 
+    if (!job_)
+    {
+        job_ = ::CreateJobObjectW(nullptr, nullptr);
+        if (job_)
+        {
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits = {};
+            limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            ::SetInformationJobObject(job_, JobObjectExtendedLimitInformation, &limits, sizeof(limits));
+        }
+    }
+
     STARTUPINFOW startup = {};
     startup.cb = sizeof(startup);
     PROCESS_INFORMATION process = {};
     std::vector<wchar_t> mutable_command(command.begin(), command.end());
     mutable_command.push_back(L'\0');
-    if (!::CreateProcessW(nullptr, mutable_command.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &startup, &process))
+    // Start suspended so the server is inside the job before it runs any code.
+    if (!::CreateProcessW(nullptr, mutable_command.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW | CREATE_SUSPENDED, nullptr, nullptr, &startup, &process))
     {
         error = "Could not start llama-server.exe";
         return false;
     }
+    if (job_)
+        ::AssignProcessToJobObject(job_, process.hProcess);
+    ::ResumeThread(process.hThread);
     {
         std::lock_guard<std::mutex> lock(process_mutex_);
         process_ = process;
@@ -1045,7 +1162,8 @@ void LlamaServerBackend::TerminateServer()
 
 bool LlamaServerBackend::WaitForHealth(const LlamaRunConfig& config, std::string& error)
 {
-    for (int attempt = 0; attempt < 240; ++attempt)
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(std::max(1000, config.health_timeout_ms));
+    while (std::chrono::steady_clock::now() < deadline)
     {
         if (IsStopRequested())
         {
@@ -1069,7 +1187,9 @@ bool LlamaServerBackend::WaitForHealth(const LlamaRunConfig& config, std::string
             return true;
         std::this_thread::sleep_for(std::chrono::milliseconds(250));
     }
-    error = "llama-server did not become healthy before the timeout";
+    error = config.attach_existing
+        ? "No healthy llama-server answered on port " + std::to_string(config.port)
+        : std::string("llama-server did not become healthy before the timeout");
     return false;
 }
 

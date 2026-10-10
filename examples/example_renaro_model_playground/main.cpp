@@ -9,8 +9,10 @@
 #include "imgui_impl_win32.h"
 #include "imgui_impl_dx11.h"
 #include "llama_backend.h"
+#include "headless.h"
 
 #include <windows.h>
+#include <shellapi.h> // CommandLineToArgvW (shell32.lib)
 #include <commdlg.h>
 #include <d3d11.h>
 #include <dwmapi.h>
@@ -604,6 +606,9 @@ struct AppState
     char command_search[256] = {};
     char trace_filter[128] = {};
     float temperature = 0.70f;
+    float top_p = 0.95f;
+    int top_k = 40;
+    int thinking_mode = 0; // 0 chat template default, 1 on, 2 off
     int context = 8192;
     int max_tokens = 512;
     int threads = 8;
@@ -675,6 +680,8 @@ static std::string CurrentRunCommand(const AppState& app)
                 command << " --mlock";
             if (!app.kv_offload)
                 command << " --no-kv-offload";
+            if (app.thinking_mode != 0)
+                command << " --jinja";
             return command.str();
         }
     }
@@ -929,6 +936,9 @@ static LlamaRunConfig BaseRunConfig(const AppState& app)
     config.server_path = app.server_path;
     config.context = app.context;
     config.temperature = app.temperature;
+    config.top_p = app.top_p;
+    config.top_k = app.top_k;
+    config.enable_thinking = app.thinking_mode == 1 ? 1 : (app.thinking_mode == 2 ? 0 : -1);
     config.max_tokens = app.max_tokens;
     config.threads = app.threads;
     config.threads_batch = app.threads_batch;
@@ -1642,6 +1652,11 @@ static void ImportModel(AppState& app)
 
 static void LocateServer(AppState& app)
 {
+    if (app.run_busy || app.pipeline.running)
+    {
+        ShowToast(app, "Change the server binary after the current run");
+        return;
+    }
     std::wstring selected_path;
     if (ChooseServerFile(selected_path))
     {
@@ -2145,8 +2160,9 @@ static bool NavItem(const char* id, const char* icon, const char* label, const c
 static void DrawEngineCard(AppState& app)
 {
     const bool has_server = !app.server_path.empty();
-    const ImVec4 state_color = app.run_busy ? kAccent : (has_server ? kSuccess : kWarning);
-    const char* state_label = app.run_busy ? "running" : (has_server ? "ready" : "missing");
+    const bool engine_busy = app.run_busy || app.pipeline.running;
+    const ImVec4 state_color = engine_busy ? kAccent : (has_server ? kSuccess : kWarning);
+    const char* state_label = engine_busy ? "running" : (has_server ? "ready" : "missing");
 
     BeginCard("##EngineCard", ImVec2(0.0f, Px(150.0f)), ImGuiChildFlags_None, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse, ImVec2(Px(12.0f), Px(12.0f)), kSurface);
     const float right = ImGui::GetCursorScreenPos().x + ImGui::GetContentRegionAvail().x;
@@ -2157,7 +2173,7 @@ static void DrawEngineCard(AppState& app)
     Pill(state_label, state_color);
 
     const ImVec2 row = ImGui::GetCursorScreenPos();
-    StatusDot(ImGui::GetWindowDrawList(), ImVec2(row.x + Px(4.0f), row.y + Px(9.0f)), Px(3.5f), state_color, app.run_busy);
+    StatusDot(ImGui::GetWindowDrawList(), ImVec2(row.x + Px(4.0f), row.y + Px(9.0f)), Px(3.5f), state_color, engine_busy);
     ImGui::SetCursorScreenPos(ImVec2(row.x + Px(16.0f), row.y));
     TextWithFont(g_font_semibold, kFontBody - 0.5f, kInk, "llama.cpp server");
     {
@@ -2168,7 +2184,7 @@ static void DrawEngineCard(AppState& app)
             ImGui::SetItemTooltip("%s", WideToUtf8(app.server_path).c_str());
     }
     VerticalSpace(2.0f);
-    ImGui::BeginDisabled(app.run_busy);
+    ImGui::BeginDisabled(engine_busy);
     if (UiButton("##LocateServer", ICON_FOLDER, has_server ? "Change binary" : "Locate llama-server", has_server ? ButtonKind::Ghost : ButtonKind::Secondary, ImVec2(-1.0f, Px(30.0f)), kFontSmall))
         LocateServer(app);
     ImGui::EndDisabled();
@@ -2228,7 +2244,13 @@ static void DrawRail(AppState& app)
 static void StatusPillState(const AppState& app, ImVec4& color, std::string& label, bool& pulsing)
 {
     pulsing = false;
-    if (app.run_busy)
+    if (app.pipeline.running)
+    {
+        color = app.pipeline.stop_requested ? kWarning : kAccent;
+        label = app.pipeline.stop_requested ? std::string("Stopping pipeline") : "Pipeline \xC2\xB7 step " + std::to_string(app.pipeline.steps) + " of " + std::to_string(app.pipeline.max_steps);
+        pulsing = true;
+    }
+    else if (app.run_busy)
     {
         color = app.stop_requested ? kWarning : kAccent;
         label = app.stop_requested ? "Stopping" : app.backend.Status();
@@ -2265,7 +2287,9 @@ static void DrawHeader(AppState& app)
 {
     struct PageInfo { const char* title; const char* subtitle; };
     PageInfo page = { "Playground", "One prompt, every selected model, measured on this machine." };
-    if (app.pane == Pane::Diagnostics)
+    if (app.pane == Pane::Pipeline)
+        page = { "Pipeline", "Wire models together: chains, parallel branches and back-and-forth loops." };
+    else if (app.pane == Pane::Diagnostics)
         page = { "Diagnostics", "Throughput, token accounting and resources for each model in the last run." };
     else if (app.pane == Pane::Trace)
         page = { "Trace log", "The llama.cpp event sequence recorded for every model." };
@@ -3816,6 +3840,8 @@ static void SettingSwitch(const char* id, const char* label, const char* help, b
     ToggleSwitch(id, value);
 }
 
+static bool SegmentedControl(const char* id, const char* const* labels, int count, int* value);
+
 static void DrawSettings(AppState& app)
 {
     const float available = ImGui::GetContentRegionAvail().x;
@@ -3870,6 +3896,15 @@ static void DrawSettings(AppState& app)
         {
             SettingLabel("Temperature", "Higher values make output more varied.");
             ImGui::SliderFloat("##SettingsTemperature", &app.temperature, 0.0f, 1.5f, "%.2f");
+            SettingLabel("Top-p", "Sample only from the most likely tokens whose probabilities add up to this.");
+            ImGui::SliderFloat("##SettingsTopP", &app.top_p, 0.05f, 1.0f, "%.2f");
+            SettingLabel("Top-k", "Sample only from this many of the most likely tokens.");
+            ImGui::SliderInt("##SettingsTopK", &app.top_k, 1, 200);
+            SettingLabel("Thinking", "enable_thinking for the chat template. On and Off start llama-server with --jinja.");
+            {
+                static const char* const kThinkingLabels[] = { "Model default", "On", "Off" };
+                SegmentedControl("##SettingsThinking", kThinkingLabels, 3, &app.thinking_mode);
+            }
             SettingLabel("Max output tokens", "Upper bound on generated tokens per model.");
             ImGui::SliderInt("##SettingsMaxTokens", &app.max_tokens, 16, 8192);
             SettingLabel("Seed", "Fixed seed for reproducible comparisons.");
@@ -7029,9 +7064,12 @@ static const PaletteAction kPaletteActions[] = {
     { ICON_PLAY, "Run selected models", "Send the current prompt to every selected model", "run-selected", "Enter" },
     { ICON_ADD, "Import model", "Add a local .gguf file to the library", "import", nullptr },
     { ICON_CHAT, "Open playground", "Conversation and model library", "playground", "1" },
-    { ICON_DIAG, "Open diagnostics", "Compare timing, tokens and memory", "diagnostics", "2" },
-    { ICON_HISTORY, "Open trace log", "Inspect the llama.cpp event sequence", "trace", "3" },
-    { ICON_SETTINGS, "Open settings", "Engine and sampling controls", "settings", "4" },
+    { ICON_FLOW, "Open pipeline", "Wire models into chains, branches and loops", "pipeline", "2" },
+    { ICON_PLAY, "Run pipeline", "Send the pipeline prompt through the graph", "run-pipeline", nullptr },
+    { ICON_STOP, "Stop pipeline", "Stop every model in the running pipeline", "stop-pipeline", nullptr },
+    { ICON_DIAG, "Open diagnostics", "Compare timing, tokens and memory", "diagnostics", "3" },
+    { ICON_HISTORY, "Open trace log", "Inspect the llama.cpp event sequence", "trace", "4" },
+    { ICON_SETTINGS, "Open settings", "Engine and sampling controls", "settings", "5" },
     { ICON_FOLDER, "Locate llama-server", "Choose the llama-server.exe binary", "locate", nullptr },
     { ICON_COPY, "Copy launch command", "Copy the equivalent llama-server command", "copy", nullptr },
     { ICON_DELETE, "Clear playground", "Remove messages and measured results", "clear-playground", nullptr }
@@ -7045,6 +7083,15 @@ static void RunCommandAction(AppState& app, const char* action)
         FocusPrompt(app);
     else if (std::strcmp(action, "playground") == 0)
         app.pane = Pane::Playground;
+    else if (std::strcmp(action, "pipeline") == 0)
+        app.pane = Pane::Pipeline;
+    else if (std::strcmp(action, "run-pipeline") == 0)
+    {
+        app.pane = Pane::Pipeline;
+        StartPipelineRun(app);
+    }
+    else if (std::strcmp(action, "stop-pipeline") == 0)
+        StopPipelineRun(app);
     else if (std::strcmp(action, "diagnostics") == 0)
         app.pane = Pane::Diagnostics;
     else if (std::strcmp(action, "trace") == 0)
@@ -7395,6 +7442,21 @@ static ImFont* LoadUiFont(const char* path, float size, bool merge_icons)
 
 int main(int, char**)
 {
+    // Any option on the command line runs the headless batch mode instead of the window.
+    // The wide command line keeps non-ASCII paths intact.
+    {
+        int wide_argc = 0;
+        LPWSTR* wide_argv = ::CommandLineToArgvW(::GetCommandLineW(), &wide_argc);
+        if (wide_argv && HeadlessRequested(wide_argc, wide_argv))
+        {
+            const int exit_code = RunHeadless(wide_argc, wide_argv, FindLlamaServer().wstring());
+            ::LocalFree(wide_argv);
+            return exit_code;
+        }
+        if (wide_argv)
+            ::LocalFree(wide_argv);
+    }
+
     ImGui_ImplWin32_EnableDpiAwareness();
     const float main_scale = ImGui_ImplWin32_GetDpiScaleForMonitor(::MonitorFromPoint(POINT{ 0, 0 }, MONITOR_DEFAULTTOPRIMARY));
     g_ui_scale = main_scale;

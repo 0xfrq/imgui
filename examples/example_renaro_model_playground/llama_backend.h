@@ -49,6 +49,28 @@ struct LlamaRunConfig
     float top_p = 0.0f;
     int top_k = 0;
     float repeat_penalty = 0.0f;
+    // min_p < 0 and penalties of 0 leave the server default in place.
+    float min_p = -1.0f;
+    float presence_penalty = 0.0f;
+    float frequency_penalty = 0.0f;
+    // Send every sampling field above exactly as set, so the request never depends on
+    // server defaults. Headless runs use this for reproducibility.
+    bool explicit_sampling = false;
+
+    // chat_template_kwargs.enable_thinking: -1 leaves the chat template default, 0 turns
+    // thinking off, 1 turns it on. Any value other than -1 also launches llama-server with --jinja.
+    int enable_thinking = -1;
+
+    // Server slots (-np). 0 leaves the llama-server default.
+    int parallel = 0;
+    // Extra llama-server arguments appended to the launch command.
+    std::vector<std::wstring> extra_server_args;
+    // Use a llama-server that is already listening on port instead of launching one.
+    bool attach_existing = false;
+    // How long to wait for /health after launching (or attaching to) llama-server.
+    int health_timeout_ms = 60000;
+    // Accept an empty assistant message as a valid empty answer instead of an error.
+    bool allow_empty_content = false;
 
     // Optional conversation framing. When set, the request is
     // [system] + history + [user: prompt] instead of a single user message.
@@ -76,6 +98,8 @@ struct LlamaRunResult
     bool stopped_word = false;
     bool stopped_limit = false;
     std::string text;
+    // Assistant content exactly as returned. Unlike text, never falls back to the reasoning.
+    std::string content;
     std::string delta;
     std::string reasoning;
     std::string reasoning_delta;
@@ -93,6 +117,7 @@ struct LlamaRunResult
     std::string metrics_summary;
     std::string timings_source;
     int http_status = 0;
+    int total_slots = 0;
     int slot_id = -1;
     int prompt_tokens = 0;
     int predicted_tokens = 0;
@@ -140,7 +165,14 @@ struct LlamaRunResult
     double memory_gb = 0.0;
     double peak_memory_gb = 0.0;
     double private_memory_gb = 0.0;
+    double peak_private_memory_gb = 0.0;
 };
+
+// The exact llama-server command line launched for a model and configuration.
+std::wstring LlamaServerCommandLine(const LlamaModelJob& model, const LlamaRunConfig& config);
+// True when something answers HTTP on 127.0.0.1:port (any status when require_healthy is false,
+// a 2xx /health answer when it is true).
+bool LlamaServerAnswers(int port, bool require_healthy);
 
 class LlamaServerBackend
 {
@@ -175,6 +207,8 @@ private:
     std::thread worker_;
     std::deque<LlamaRunResult> results_;
     PROCESS_INFORMATION process_ = {};
+    // Job that kills llama-server when this process exits, even after a crash or Ctrl+C.
+    HANDLE job_ = nullptr;
     bool busy_ = false;
     bool stop_requested_ = false;
     std::string status_ = "ready";

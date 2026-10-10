@@ -33,6 +33,7 @@ jobs:
             /I. /Ibackends ^
             examples\example_renaro_model_playground\main.cpp ^
             examples\example_renaro_model_playground\llama_backend.cpp ^
+            examples\example_renaro_model_playground\headless.cpp ^
             backends\imgui_impl_dx11.cpp ^
             backends\imgui_impl_win32.cpp ^
             imgui.cpp ^
@@ -42,7 +43,7 @@ jobs:
             imgui_widgets.cpp ^
             /Fe:build\renaro_model_playground\renaro_model_playground.exe ^
             /Fo:build\renaro_model_playground\ ^
-            /link d3d11.lib d3dcompiler.lib dxgi.lib windowscodecs.lib comdlg32.lib ole32.lib gdi32.lib dwmapi.lib winhttp.lib psapi.lib
+            /link d3d11.lib d3dcompiler.lib dxgi.lib windowscodecs.lib comdlg32.lib ole32.lib gdi32.lib dwmapi.lib winhttp.lib psapi.lib shell32.lib
 
       - name: Package Renaro logo
         shell: cmd
@@ -56,3 +57,13 @@ jobs:
           name: renaro-model-playground-windows
           path: build/renaro_model_playground
           if-no-files-found: error
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Runs headless mode end to end against a mock llama-server (no model needed).
+      - name: Smoke test headless mode
+        shell: cmd
+        run: python examples\example_renaro_model_playground\tests\headless_smoke_test.py build\renaro_model_playground\renaro_model_playground.exe
