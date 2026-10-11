@@ -1,5 +1,9 @@
 #include "llama_backend.h"
 
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0600
+#endif
+
 #include <winsock2.h>
 // The Windows SDK only declares the IPv6 TCP tables (MIB_TCP6TABLE_OWNER_PID) after ws2ipdef.h,
 // which ws2tcpip.h pulls in.
