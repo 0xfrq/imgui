@@ -792,7 +792,7 @@ static void AppendRunTrace(AppState& app, const LlamaRunResult& result)
         + ", ubatch " + FormatCount(result.ubatch_size)
         + ", threads " + FormatCount(result.threads)
         + ", GPU layers " + FormatCount(result.gpu_layers);
-    app.trace.push_back({ model, "server load", FormatSeconds(result.server_load_seconds), "ready", "llama-server process and /health" });
+    app.trace.push_back({ model, "server load", FormatSeconds(result.server_load_seconds), "ready", "llama-server process and /health on port " + std::to_string(result.port) });
     app.trace.push_back({ model, "server config", kNone, "observed", server_detail });
     app.trace.push_back({ model, "prompt eval", FormatMilliseconds(result.prompt_ms), FormatRate(result.prompt_tokens_per_second), token_detail + ", " + FormatMilliseconds(result.prompt_ms_per_token) + " per token" });
     app.trace.push_back({ model, "decode", FormatMilliseconds(result.predicted_ms), FormatRate(result.decode_tokens_per_second), "predicted " + FormatCount(result.tokens_predicted) + ", " + FormatMilliseconds(result.predicted_ms_per_token) + " per token" });

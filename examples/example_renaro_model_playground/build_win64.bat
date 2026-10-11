@@ -15,7 +15,7 @@ cl.exe /nologo /EHsc /std:c++17 /MD /utf-8 ^
   ..\..\imgui*.cpp ^
   /Fe:"%OUT_DIR%\renaro_model_playground.exe" ^
   /Fo:"%OUT_DIR%\" ^
-  /link d3d11.lib d3dcompiler.lib dxgi.lib windowscodecs.lib comdlg32.lib ole32.lib gdi32.lib dwmapi.lib winhttp.lib psapi.lib shell32.lib
+  /link d3d11.lib d3dcompiler.lib dxgi.lib windowscodecs.lib comdlg32.lib ole32.lib gdi32.lib dwmapi.lib winhttp.lib psapi.lib iphlpapi.lib shell32.lib
 
 if errorlevel 1 goto :failed
 echo Built %OUT_DIR%\renaro_model_playground.exe

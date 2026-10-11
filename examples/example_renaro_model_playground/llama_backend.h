@@ -29,6 +29,7 @@ struct LlamaChatMessage
 struct LlamaRunConfig
 {
     std::wstring server_path;
+    // A launched server moves to the next free port when another program listens on this one.
     int port = 8080;
     int context = 8192;
     float temperature = 0.70f;
@@ -116,6 +117,8 @@ struct LlamaRunResult
     std::string slot_state;
     std::string metrics_summary;
     std::string timings_source;
+    // Port the server answered on. Differs from LlamaRunConfig::port when that one was taken.
+    int port = 0;
     int http_status = 0;
     int total_slots = 0;
     int slot_id = -1;
@@ -202,6 +205,8 @@ private:
     void TerminateServer();
     mutable std::mutex process_mutex_;
     std::wstring loaded_signature_;
+    // Port the launched server listens on, claimed so no other backend launches there.
+    int server_port_ = 0;
 
     mutable std::mutex mutex_;
     std::thread worker_;

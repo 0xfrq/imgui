@@ -1,6 +1,8 @@
 #include "llama_backend.h"
 
+#include <winsock2.h>
 #include <windows.h>
+#include <iphlpapi.h>
 #include <psapi.h>
 #include <winhttp.h>
 
@@ -10,6 +12,7 @@
 #include <cstring>
 #include <functional>
 #include <iomanip>
+#include <set>
 #include <sstream>
 #include <thread>
 #include <utility>
@@ -456,6 +459,92 @@ static double ReadProcessCpuSeconds(HANDLE process)
     user_ticks.HighPart = user.dwHighDateTime;
     return static_cast<double>(kernel_ticks.QuadPart + user_ticks.QuadPart) / 10000000.0;
 }
+
+// Process ids of everything listening on TCP port `port` (IPv4 or IPv6, any address).
+// Returns false when Windows cannot list the listeners.
+static bool ListPortListeners(int port, std::vector<DWORD>& owners)
+{
+    owners.clear();
+    // dwLocalPort holds the port in network byte order in its low 16 bits.
+    const auto row_port = [](DWORD value) { return static_cast<int>(((value & 0xFF) << 8) | ((value >> 8) & 0xFF)); };
+    const ULONG families[] = { AF_INET, AF_INET6 };
+    for (const ULONG family : families)
+    {
+        std::vector<unsigned char> buffer;
+        DWORD size = 0;
+        DWORD status = ERROR_INSUFFICIENT_BUFFER;
+        // The table can grow between the size query and the read, so retry a few times.
+        for (int attempt = 0; attempt < 4 && status == ERROR_INSUFFICIENT_BUFFER; ++attempt)
+        {
+            buffer.resize(size);
+            status = ::GetExtendedTcpTable(buffer.empty() ? nullptr : buffer.data(), &size, FALSE, family, TCP_TABLE_OWNER_PID_LISTENER, 0);
+        }
+        if (status != NO_ERROR || buffer.size() < sizeof(DWORD))
+            return false;
+        if (family == AF_INET)
+        {
+            const MIB_TCPTABLE_OWNER_PID* table = reinterpret_cast<const MIB_TCPTABLE_OWNER_PID*>(buffer.data());
+            for (DWORD index = 0; index < table->dwNumEntries; ++index)
+                if (row_port(table->table[index].dwLocalPort) == port)
+                    owners.push_back(table->table[index].dwOwningPid);
+        }
+        else
+        {
+            const MIB_TCP6TABLE_OWNER_PID* table = reinterpret_cast<const MIB_TCP6TABLE_OWNER_PID*>(buffer.data());
+            for (DWORD index = 0; index < table->dwNumEntries; ++index)
+                if (row_port(table->table[index].dwLocalPort) == port)
+                    owners.push_back(table->table[index].dwOwningPid);
+        }
+    }
+    return true;
+}
+
+// True for the launched server or a process in its job. Package-manager shims (scoop,
+// chocolatey) start the real llama-server as a child, and children stay in the job.
+static bool IsServerProcess(DWORD pid, DWORD server_pid, HANDLE job)
+{
+    if (pid == server_pid)
+        return true;
+    if (!job)
+        return false;
+    HANDLE process = ::OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!process)
+        return false;
+    BOOL in_job = FALSE;
+    const bool ok = ::IsProcessInJob(process, job, &in_job) != FALSE;
+    ::CloseHandle(process);
+    return ok && in_job;
+}
+
+// Ports claimed by servers this process launched, so two backends never pick the same one.
+static std::mutex g_port_mutex;
+static std::set<int> g_claimed_ports;
+
+// Claims `port`, or the first port after it that nothing listens on. Another program on the
+// port (Open WebUI also defaults to 8080) would otherwise answer /health and then reject the
+// chat request. Returns 0 when the next 100 ports are all taken.
+static int ClaimFreePort(int port)
+{
+    std::lock_guard<std::mutex> lock(g_port_mutex);
+    for (int candidate = port; candidate <= 65535 && candidate < port + 100; ++candidate)
+    {
+        if (g_claimed_ports.count(candidate))
+            continue;
+        std::vector<DWORD> owners;
+        const bool in_use = ListPortListeners(candidate, owners) ? !owners.empty() : LlamaServerAnswers(candidate, false);
+        if (in_use)
+            continue;
+        g_claimed_ports.insert(candidate);
+        return candidate;
+    }
+    return 0;
+}
+
+static void ReleasePort(int port)
+{
+    std::lock_guard<std::mutex> lock(g_port_mutex);
+    g_claimed_ports.erase(port);
+}
 }
 
 std::wstring LlamaServerCommandLine(const LlamaModelJob& model, const LlamaRunConfig& config)
@@ -582,8 +671,11 @@ void LlamaServerBackend::RunComparison(std::vector<LlamaModelJob> models, std::s
     status_ = "ready";
 }
 
-bool LlamaServerBackend::RunModel(const LlamaModelJob& model, const std::string& prompt, const LlamaRunConfig& config, LlamaRunResult& result)
+bool LlamaServerBackend::RunModel(const LlamaModelJob& model, const std::string& prompt, const LlamaRunConfig& requested_config, LlamaRunResult& result)
 {
+    // config.port becomes the port the server really listens on, which may differ from the
+    // requested one. The reuse signature stays on the requested port.
+    LlamaRunConfig config = requested_config;
     const auto mark_cancelled = [&]()
     {
         result.ok = false;
@@ -606,12 +698,14 @@ bool LlamaServerBackend::RunModel(const LlamaModelJob& model, const std::string&
 
     std::string error;
     const auto server_started = std::chrono::steady_clock::now();
-    const std::wstring signature = ServerSignature(model, config);
+    const std::wstring signature = ServerSignature(model, requested_config);
     bool reuse_server = false;
     if (config.keep_server_alive && !config.attach_existing)
     {
         std::lock_guard<std::mutex> lock(process_mutex_);
         reuse_server = process_.hProcess && loaded_signature_ == signature && ::WaitForSingleObject(process_.hProcess, 0) == WAIT_TIMEOUT;
+        if (reuse_server)
+            config.port = server_port_;
     }
     if (config.attach_existing)
     {
@@ -634,9 +728,19 @@ bool LlamaServerBackend::RunModel(const LlamaModelJob& model, const std::string&
     {
         // A server kept alive for a different model or launch setting must go first.
         StopServer();
-        SetStatus("loading " + model.name);
+        config.port = ClaimFreePort(requested_config.port);
+        if (config.port == 0)
+        {
+            result.error = "Ports " + std::to_string(requested_config.port) + " to " + std::to_string(requested_config.port + 99) + " are all in use by other programs";
+            return false;
+        }
+        if (config.port != requested_config.port)
+            SetStatus("port " + std::to_string(requested_config.port) + " is in use by another program; loading " + model.name + " on port " + std::to_string(config.port));
+        else
+            SetStatus("loading " + model.name);
         if (!StartServer(model, config, error))
         {
+            ReleasePort(config.port);
             if (IsStopRequested())
                 mark_cancelled();
             else
@@ -646,6 +750,7 @@ bool LlamaServerBackend::RunModel(const LlamaModelJob& model, const std::string&
         {
             std::lock_guard<std::mutex> lock(process_mutex_);
             loaded_signature_ = signature;
+            server_port_ = config.port;
         }
         if (!WaitForHealth(config, error))
         {
@@ -664,6 +769,7 @@ bool LlamaServerBackend::RunModel(const LlamaModelJob& model, const std::string&
         return false;
     }
     result.server_load_seconds = (reuse_server || config.attach_existing) ? 0.0 : std::chrono::duration<double>(std::chrono::steady_clock::now() - server_started).count();
+    result.port = config.port;
 
     SetStatus("streaming " + model.name);
     std::ostringstream body;
@@ -1137,11 +1243,14 @@ bool LlamaServerBackend::StartServer(const LlamaModelJob& model, const LlamaRunC
 void LlamaServerBackend::StopServer()
 {
     PROCESS_INFORMATION process = {};
+    int port = 0;
     {
         std::lock_guard<std::mutex> lock(process_mutex_);
         process = process_;
         process_ = {};
         loaded_signature_.clear();
+        port = server_port_;
+        server_port_ = 0;
     }
     if (process.hProcess)
     {
@@ -1151,6 +1260,9 @@ void LlamaServerBackend::StopServer()
             ::CloseHandle(process.hThread);
         ::CloseHandle(process.hProcess);
     }
+    // Released after the process is gone so the port is really free for the next claim.
+    if (port != 0)
+        ReleasePort(port);
 }
 
 void LlamaServerBackend::TerminateServer()
@@ -1171,20 +1283,36 @@ bool LlamaServerBackend::WaitForHealth(const LlamaRunConfig& config, std::string
             return false;
         }
         HANDLE process_handle = nullptr;
+        DWORD server_pid = 0;
         {
             std::lock_guard<std::mutex> lock(process_mutex_);
             process_handle = process_.hProcess;
+            server_pid = process_.dwProcessId;
         }
         if (process_handle && ::WaitForSingleObject(process_handle, 0) == WAIT_OBJECT_0)
         {
-            error = "llama-server exited before becoming healthy";
+            std::vector<DWORD> owners;
+            error = ListPortListeners(config.port, owners) && !owners.empty()
+                ? "llama-server could not open port " + std::to_string(config.port) + " because another program is using it"
+                : std::string("llama-server exited before becoming healthy");
             return false;
         }
         std::string response;
         DWORD status_code = 0;
         std::string request_error;
         if (HttpRequest(config.port, L"GET", L"/health", {}, response, status_code, request_error))
-            return true;
+        {
+            if (config.attach_existing || !process_handle)
+                return true;
+            // Only our own server counts: a program that took the port after ClaimFreePort can
+            // answer /health as well. If the listeners cannot be read, trust the answer.
+            std::vector<DWORD> owners;
+            if (!ListPortListeners(config.port, owners))
+                return true;
+            for (DWORD owner : owners)
+                if (IsServerProcess(owner, server_pid, job_))
+                    return true;
+        }
         std::this_thread::sleep_for(std::chrono::milliseconds(250));
     }
     error = config.attach_existing
